@@ -7,9 +7,9 @@ usage() {
 arena —— 把 arena.ai 的 Agent 接进本地工作流
 
 用法:
-  arena                     进入交互式对话（REPL，默认 Agent 模式）
+  arena                     进入 Codex 风格的 TUI（默认）
   arena "问题"               单发提问，打印答案后退出
-  arena chat [选项]          显式进入 REPL（同直接输入 arena）
+  arena chat [选项]          进 aichat 的轻量 REPL（脚本友好）
 
 单发选项:
   -d, --direct              Direct 模式（单模型，更快更省）
@@ -38,8 +38,12 @@ EOF
 }
 
 case "${1:-}" in
-  ""|chat|repl|-i|--interactive)
+  ""|tui|--tui)
     [ $# -gt 0 ] && shift
+    exec arena-codex "$@"
+    ;;
+  chat|repl|-i|--interactive)
+    shift
     exec arena-chat "$@"
     ;;
   help|-h|--help) usage; exit 0 ;;

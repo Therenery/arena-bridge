@@ -18,5 +18,5 @@ fi
 export ARENA_API_KEY="sk-arena-local"
 export RUST_LOG="${RUST_LOG:-error}"
 
-exec "${CODEX_BIN:-/root/.local/codex/codex}" "$@"
+exec "${CODEX_BIN:-/root/.local/codex/codex}" --no-daemon "$@"
 

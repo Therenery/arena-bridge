@@ -22,6 +22,8 @@ arena —— 把 arena.ai 的 Agent 接进本地工作流
 运维:
   arena models              列出可用模型
   arena sessions            列出本地保存的会话
+  arena repos               列出页面里可选的 GitHub 仓库
+  arena repo <owner/name>   切换工作区仓库（等于开新对话）
   arena new [名字]           清空会话（服务端历史 + 本地记录）
   arena doctor              体检：隧道 / 桥接 / Chrome / 模型 / 客户端
   arena help                本帮助
@@ -59,6 +61,20 @@ case "${1:-}" in
     fi
     rm -f "$HOME/.config/aichat/sessions/$S.yaml"
     echo "已清空会话 $S"
+    ;;
+  repos|--repos)
+    shift
+    curl -s --max-time 2 http://127.0.0.1:17892/health >/dev/null 2>&1 || arena-tunnel >/dev/null 2>&1
+    R=$(curl -s --max-time 150 "http://127.0.0.1:17892/repos")
+    echo "$R" | jq -r 'if .repos then "当前: \(.repo)\n" + (.repos | join("\n")) else "失败: \(.error // "未知")" end' 2>/dev/null || echo "$R"
+    ;;
+  repo|--repo)
+    shift
+    W=${1:-}
+    if [ -z "$W" ]; then echo "用法: arena repo <owner/name>" >&2; exit 2; fi
+    curl -s --max-time 2 http://127.0.0.1:17892/health >/dev/null 2>&1 || arena-tunnel >/dev/null 2>&1
+    R=$(curl -s --max-time 200 --get --data-urlencode "name=$W" "http://127.0.0.1:17892/repo")
+    echo "$R" | jq -r 'if .ok then "已切到 \(.repo)，新对话已开" else "失败: \(.error // "未知")" end' 2>/dev/null || echo "$R"
     ;;
   doctor)
     echo "== 隧道 =="

@@ -90,3 +90,24 @@ arena doctor             # 隧道 / 桥接 / Chrome / 模型 体检
 
 私有仓库，未授权分发。
 
+
+## Codex TUI（可选）
+
+Codex CLI 只认 Responses API，桥接旁边加了一个适配器 `cli/arena-responses`（监听 127.0.0.1:17893），把 Responses 转成 chat/completions。
+
+```bash
+arena-codex            # 自动建隧道、拉起适配器，进 Codex 的 TUI
+```
+
+provider 配置见 `codex/config.toml.example`：`wire_api = "responses"`、`base_url = http://127.0.0.1:17893/v1`、`env_key = "ARENA_API_KEY"`。
+
+从 GitHub Releases 下载的非打包二进制要加 `--no-daemon`，否则报 `no complete local package`。
+
+## 仓库切换
+
+```bash
+arena repos                    # 列出页面里可选的 GitHub 仓库
+arena repo Therenery/Backrooms # 切换工作区仓库（等于开新对话）
+arena chat -R Therenery/xxx    # 进 REPL 前先切
+```
+

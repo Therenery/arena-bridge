@@ -6,6 +6,7 @@ MODEL=arena-agent
 SESSION=${ARB_SESSION:-main}
 NOBANNER=0
 FRESH=0
+REPO=''
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -14,6 +15,7 @@ while [ $# -gt 0 ]; do
     -s|--session)  SESSION="${2:-main}"; shift 2 ;;
     -m|--model)    MODEL="${2:-arena-agent}"; shift 2 ;;
     -n|--fresh)    FRESH=1; shift ;;
+    -R|--repo)     REPO="${2:-}"; shift 2 ;;
     -q|--quiet)    NOBANNER=1; shift ;;
     -h|--help)
       cat <<'EOF'
@@ -23,6 +25,7 @@ while [ $# -gt 0 ]; do
   -a, --agent          Agent 模式（默认，可跑工具、读仓库）
   -s, --session 名字    会话名（默认 main）
   -m, --model 名字      直接指定 arena 模型 id
+  -R, --repo 仓库      进对话前切换工作区仓库（owner/name）
   -n, --fresh          以空会话开始（丢掉该会话的旧记录）
   -q, --quiet          不打印欢迎信息
 
@@ -51,6 +54,11 @@ if ! printf '%s' "$HEALTH" | grep -q '"ok":true'; then
   HEALTH=$(curl -s --max-time 3 http://127.0.0.1:17892/health 2>/dev/null)
   printf '%s' "$HEALTH" | grep -q '"ok":true' || {
     echo "桥接服务异常: ${HEALTH:-无响应}" >&2; exit 1; }
+fi
+
+if [ -n "$REPO" ]; then
+  echo "切换仓库到 $REPO ..." >&2
+  curl -s --max-time 200 --get --data-urlencode "name=$REPO" "http://127.0.0.1:17892/repo"     | jq -r 'if .ok then "  已切到 \(.repo)" else "  失败: \(.error // "未知")" end' 2>/dev/null >&2
 fi
 
 if [ "$NOBANNER" != 1 ] && [ -t 1 ]; then

@@ -19,6 +19,12 @@ const MAX_QUEUE = 4;
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+/* ---------- repo picker ---------- */
+const OPEN_PICKER_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];if(!b)return 'NO_CHIP';var r=b.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;var o={bubbles:true,cancelable:true,clientX:x,clientY:y,view:window,button:0,buttons:1,pointerId:1,isPrimary:true,pointerType:'mouse'};b.dispatchEvent(new PointerEvent('pointerdown',o));b.dispatchEvent(new MouseEvent('mousedown',o));b.dispatchEvent(new PointerEvent('pointerup',o));b.dispatchEvent(new MouseEvent('mouseup',o));b.dispatchEvent(new MouseEvent('click',o));return 'OK'})()";
+const LIST_REPOS_JS = "(function(){var d=document.querySelector('[role=dialog]');if(!d)return JSON.stringify({open:false,items:[]});var items=[].slice.call(d.querySelectorAll('button,[role=option]')).map(function(x){return (x.innerText||'').trim()}).filter(function(t){return /^[\\w.-]+\\/[\\w.-]+$/.test(t)});return JSON.stringify({open:true,items:items})})()";
+const CHIP_TEXT_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];return b?(b.innerText||'').trim():''})()";
+const pickRepoJs = name => "(function(){var d=document.querySelector('[role=dialog]');if(!d)return 'NO_DIALOG';var t=[].slice.call(d.querySelectorAll('button,[role=option]')).filter(function(x){return (x.innerText||'').trim()===" + JSON.stringify(name) + "})[0];if(!t)return 'NO_ITEM';t.click();return 'PICKED'})()";
+
 /* ---------- CDP plumbing ---------- */
 function cdpApi(method, path) {
   return new Promise((res, rej) => {
@@ -408,6 +414,41 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname === '/models') {
     return send(200, { models: ['auto', 'max'] });
   }
+  if (u.pathname === '/repos' || u.pathname === '/repo') {
+    const rn = u.searchParams.get('session') || 'main';
+    const want = u.searchParams.get('name') || '';
+    const doRepo = async () => {
+      let s = sessions.get(rn);
+      if (!s || want) {
+        if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(rn); histories.delete(rn); }
+        s = await getSession(rn, { mode: 'agent', fresh: true });
+        await sleep(1200);
+      }
+      let opened = '';
+      for (let i = 0; i < 12; i++) {
+        opened = await s.cdp.ev(OPEN_PICKER_JS);
+        if (opened === 'OK') break;
+        await sleep(1200);
+      }
+      if (opened !== 'OK') throw new Error('picker: ' + opened);
+      let list = { items: [] };
+      for (let i = 0; i < 10; i++) {
+        await sleep(800);
+        const raw = await s.cdp.ev(LIST_REPOS_JS);
+        try { list = raw ? JSON.parse(raw) : { items: [] }; } catch (e) { list = { items: [] }; }
+        if (list.items && list.items.length) break;
+      }
+      if (!want) {
+        await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+        return { repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
+      }
+      const picked = await s.cdp.ev(pickRepoJs(want));
+      await sleep(900);
+      if (picked !== 'PICKED') throw new Error('pick: ' + picked + ' | available: ' + list.items.join(', '));
+      return { ok: true, repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
+    };
+    return doRepo().then(r => send(200, r)).catch(e => send(500, { error: e.message }));
+  }
   if (u.pathname === '/new') {
     const name = u.searchParams.get('session') || 'default';
     histories.delete(name);
@@ -427,7 +468,8 @@ const server = http.createServer(async (req, res) => {
     const name = body.user || body.session || 'main';
     const bodyPrior = prior.length > 1 ? prior.slice(0, -1) : null;
     const srvPrior = histories.get(name) || [];
-    const useHist = bodyPrior && bodyPrior.length ? bodyPrior : (srvPrior.length ? srvPrior : null);
+    const fresh = body.arena_new === true || body.arena_continue === false;
+    const useHist = fresh ? (bodyPrior && bodyPrior.length ? bodyPrior : (srvPrior.length ? srvPrior : null)) : null;
     let prompt = last;
     if (useHist) {
       const hist = useHist.map(m => (m.role === 'assistant' ? '助手' : '用户') + '：' + String(m.content)).join('\n\n');
@@ -435,7 +477,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (sys) prompt = sys + '\n\n' + prompt;
     if (!prompt.trim()) return send(400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
-    const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', fresh: !body.arena_continue };
+    const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', fresh };
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
     const created = Math.floor(Date.now() / 1000);
@@ -501,7 +543,7 @@ const server = http.createServer(async (req, res) => {
     if (!prompt) return send(400, { error: 'empty prompt' });
     const name = body.session || 'default';
     const stream = !!body.stream;
-    const opts = { model: body.model || '', mode: body.mode || 'agent', fresh: !!body.new || !body.continue_session };
+    const opts = { model: body.model || '', mode: body.mode || 'agent', fresh: !!body.new };
 
     const run = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');

@@ -519,8 +519,8 @@ const server = http.createServer(async (req, res) => {
     const want = u.searchParams.get('name') || '';
     if (u.searchParams.get('cached')) return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
     const doRepo = async () => {
-      let s = sessions.get(rn);
-      if (!s) { s = await getSession(rn, { mode: 'agent', fresh: true }); await sleep(2000); }
+      const s = await getSession(rn, { mode: 'agent' });
+      await sleep(800);
       let list = { items: [] };
       const readList = async () => {
         const raw = await s.cdp.ev(LIST_REPOS_JS);

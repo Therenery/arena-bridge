@@ -15,7 +15,8 @@ const PORT = 17892;
 const HOST = '127.0.0.1';
 const MIN_GAP_MS = 3000;
 const READY_TIMEOUT_MS = 60000;
-const ASK_TIMEOUT_MS = 600000;
+const ASK_MAX_MS = 7200000;   // 安全上限 2 小时
+const ASK_IDLE_MS = 300000;   // 连续 5 分钟没有任何帧才判定卡死
 const POLL_MS = 400;
 const MAX_QUEUE = 4;
 
@@ -345,6 +346,22 @@ async function typePrompt(c, text) {
 }
 
 
+/* ---------- stop generation ---------- */
+const STOP_POS_JS = "(function(){var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){var s=(x.getAttribute('aria-label')||'')+' '+(x.innerText||'');return /stop|\u505c\u6b62/i.test(s)}).filter(function(x){var r=x.getBoundingClientRect();return r.width>2&&r.height>2})[0];if(!b)return '';var r=b.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()";
+async function isGenerating(c) {
+  const v = await c.ev(STOP_POS_JS).catch(() => '');
+  return !!(v && v.charAt(0) === '{');
+}
+async function stopGeneration(c) {
+  const v = await c.ev(STOP_POS_JS).catch(() => '');
+  if (!v || v.charAt(0) !== '{') return false;
+  try { await realClick(c, JSON.parse(v)); } catch (e) { return false; }
+  for (let i = 0; i < 24; i++) {
+    await sleep(500);
+    if (!(await isGenerating(c))) return true;
+  }
+  return false;
+}
 /* ---------- stream reading ---------- */
 async function listStreams(c) {
   const v = await c.evJson("(function(){return JSON.stringify((window.__arbStreams||[]).map(function(s){return {id:s.id,u:s.u,t:s.t,n:s.frames.length,done:!!s.done}}))})()");
@@ -415,6 +432,11 @@ async function askOnce(s, prompt, onDelta) {
   const c = s.cdp;
   if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
   if (!(await c.ev(READY_JS))) { await waitReady(c); }
+  if (await isGenerating(c)) {
+    log('previous turn still generating, stopping it first');
+    await stopGeneration(c);
+    await sleep(800);
+  }
   await waitConversation(c);
   await waitIdle(c);
   const preList = (await listStreams(c)) || [];
@@ -474,7 +496,7 @@ async function askOnce(s, prompt, onDelta) {
   };
 
   let sendRetries = 0, lastSendAt = Date.now();
-  while (Date.now() - t0 < ASK_TIMEOUT_MS) {
+  while (Date.now() - t0 < ASK_MAX_MS) {
     await sleep(POLL_MS);
     if (c.closed) throw new Error('tab closed');
     const now = (await listStreams(c)) || [];
@@ -516,7 +538,7 @@ async function askOnce(s, prompt, onDelta) {
       if (text.trim() && Date.now() - lastFrameAt > 8000) { done = true; break; }
       if (Date.now() - doneNoTextAt > 20000) throw new Error('stream ended with no text (session may be in review state)');
     }
-    if (Date.now() - lastFrameAt > 150000) throw new Error('stalled: no frame for 150s');
+    if (Date.now() - lastFrameAt > ASK_IDLE_MS) throw new Error('stalled: no frame for ' + Math.round(ASK_IDLE_MS / 1000) + 's');
   }
   if (!text.trim()) throw new Error('empty answer from upstream');
   return { text, reasoning, routed: routed[routed.length - 1] || '', done, tools };
@@ -805,7 +827,8 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         res.write('data: [DONE]\n\n');
       } catch (e) {
         log('v1 error:', e.message);
-        try { await resetSession(name); } catch (e9) {}
+        if (s) { try { await stopGeneration(s); } catch (e9) {} }
+        if (/composer still holds|send failed|page not ready|ws closed|tab closed|no composer/.test(e.message)) { try { await resetSession(name); } catch (e9) {} }
         try { res.write('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n'); } catch (e8) {}
       }
       endSSE();

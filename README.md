@@ -168,3 +168,15 @@ Arena 的输入框是 tiptap/ProseMirror。只有逐字符的真实键盘事件�
 
 新会话就是导航到 https://arena.ai/agent （不带会话 id）。仓库/连接器选择是账号级状态，新会话自动继承，/repo 只在需要换库时用。
 
+### 从源码构建（开源版）
+
+~~~powershell
+git clone --depth 1 https://github.com/QwenLM/qwen-code.git
+cd qwen-code
+git apply F:\path\to\arena-bridge\patches\arena-code.patch
+corepack pnpm install
+corepack pnpm run build
+~~~
+
+补丁做四件事：把内置 banner 换成 ARENA 字符画（青色→靛紫渐变）、标题改 Arena Code、清掉所有俏皮加载文案、程序名改成 arena。
+

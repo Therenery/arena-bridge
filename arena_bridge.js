@@ -249,6 +249,14 @@ async function waitReady(c) {
   throw new Error('page not ready (no composer)');
 }
 
+let lastMinAt = 0;
+function minimizeChrome() {
+  const now = Date.now();
+  if (now - lastMinAt < 1200) return;
+  lastMinAt = now;
+  try { exec('schtasks /run /tn arena_minimize', () => {}); } catch (e) {}
+}
+
 async function openTab(model, mode) {
   const q = [];
   if (model && !/^arena-/.test(model)) q.push('model_a=' + encodeURIComponent(model));
@@ -261,6 +269,7 @@ async function openTab(model, mode) {
   await c.send('Page.navigate', { url });
   await waitReady(c);
   log('tab ready', tab.id, url);
+  minimizeChrome();
   return { tabId: tab.id, cdp: c, url };
 }
 
@@ -674,7 +683,8 @@ const server = http.createServer(async (req, res) => {
       for (let k = 0; k < 8; k++) { chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip === want) break; await sleep(700); }
       return { ok: true, repo: chip || want, repos: list.items };
     };
-        return doRepo().then(r => { repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { fs.writeFileSync(path.join(STATE_DIR, 'repos.json'), JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => send(500, { error: e.message }));
+        return doRepo().then(r => {
+      minimizeChrome(); repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { fs.writeFileSync(path.join(STATE_DIR, 'repos.json'), JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => { minimizeChrome(); send(500, { error: e.message }); });
   }
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;

@@ -22,10 +22,22 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 /* ---------- repo picker ---------- */
 let repoCache = { repo: "", repos: [] };
 try { repoCache = JSON.parse(require("fs").readFileSync("F:/__AI__/work/repos.json", "utf8")); } catch (e) {}
+async function realClick(c, p) {
+  await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: 'none', buttons: 0 });
+  await sleep(70);
+  await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', buttons: 1, clickCount: 1 });
+  await sleep(70);
+  await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: 0, clickCount: 1 });
+}
+const CHIP_POS_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){var t=(x.innerText||'').trim();return t.length>2&&t.length<60&&t.indexOf('/')>0&&t.indexOf(' ')<0})[0];if(!b)return '';var r=b.getBoundingClientRect();if(!r.width)return '';return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()";
+const ADD_BTN_POS_JS = "(function(){var es=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /Add files and connections/i.test(x.getAttribute('aria-label')||'')});for(var i=0;i<es.length;i++){var r=es[i].getBoundingClientRect();if(r.width>0&&r.height>0)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
+const SEL_TAB_POS_JS = "(function(){var es=[].slice.call(document.querySelectorAll('span,button,div,a'));for(var i=0;i<es.length;i++){var e=es[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='Select a repository')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
+const GH_ITEM_POS_JS = "(function(){var es=[].slice.call(document.querySelectorAll('span,button,div'));for(var i=0;i<es.length;i++){var e=es[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='GitHub')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;if(r.top<250)continue;return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
+const DIALOG_OPEN_JS = "(function(){var d=document.querySelector('[role=dialog],[role=menu]');return d?'1':'0'})()";
 const OPEN_PICKER_JS = "(function(){var fire=function(el){var r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;var o={bubbles:true,cancelable:true,clientX:x,clientY:y,view:window,button:0,buttons:1,pointerId:1,isPrimary:true,pointerType:'mouse'};el.dispatchEvent(new PointerEvent('pointerdown',o));el.dispatchEvent(new MouseEvent('mousedown',o));el.dispatchEvent(new PointerEvent('pointerup',o));el.dispatchEvent(new MouseEvent('mouseup',o));el.dispatchEvent(new MouseEvent('click',o));};var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];if(b){fire(b);return 'OK'}var g=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return (x.getAttribute('aria-label')||'')==='GitHub'})[0];if(g){fire(g);return 'CLICKED_GITHUB'}return 'NO_CHIP'})()";
-const LIST_REPOS_JS = "(function(){var d=document.querySelector('[role=dialog]');if(!d)return JSON.stringify({open:false,items:[]});var items=[].slice.call(d.querySelectorAll('button,[role=option]')).map(function(x){return (x.innerText||'').trim()}).filter(function(t){return /^[\\w.-]+\\/[\\w.-]+$/.test(t)});return JSON.stringify({open:true,items:items})})()";
+const LIST_REPOS_JS = "(function(){var d=document.querySelector('[role=dialog],[role=menu]');if(!d)return JSON.stringify({open:false,items:[]});var out=[];[].slice.call(d.querySelectorAll('*')).forEach(function(x){if(x.children.length>2)return;var t=(x.innerText||'').trim();if(!/^[\\w.-]+\\/[\\w.-]+$/.test(t))return;if(out.indexOf(t)<0)out.push(t)});return JSON.stringify({open:true,items:out})})()";
 const CHIP_TEXT_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];return b?(b.innerText||'').trim():''})()";
-const pickRepoJs = name => "(function(){var d=document.querySelector('[role=dialog]');if(!d)return 'NO_DIALOG';var t=[].slice.call(d.querySelectorAll('button,[role=option]')).filter(function(x){return (x.innerText||'').trim()===" + JSON.stringify(name) + "})[0];if(!t)return 'NO_ITEM';t.click();return 'PICKED'})()";
+const repoPosJs = name => "(function(){var d=document.querySelector('[role=dialog],[role=menu]');if(!d)return '';var es=[].slice.call(d.querySelectorAll('*')).filter(function(x){return (x.innerText||'').trim()===" + JSON.stringify(name) + " && x.children.length<=2});for(var i=0;i<es.length;i++){var r=es[i].getBoundingClientRect();if(r.width>4&&r.height>4)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
 
 /* ---------- CDP plumbing ---------- */
 function cdpApi(method, path) {
@@ -325,6 +337,7 @@ async function getSession(name, opts) {
     if (alive === 2) return s;
     sessions.delete(key); s = null;
   }
+  if (!(await ensureChrome())) throw new Error('chrome unavailable');
   const r = await openTab(opts.model, opts.mode);
   s = { name: key, tabId: r.tabId, cdp: r.cdp, model: opts.model || '', mode: opts.mode || 'direct', lastAsk: 0, busy: false };
   sessions.set(key, s);
@@ -497,34 +510,63 @@ const server = http.createServer(async (req, res) => {
     if (u.searchParams.get('cached')) return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
     const doRepo = async () => {
       let s = sessions.get(rn);
-      if (!s || want) {
-        if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(rn); histories.delete(rn); }
-        s = await getSession(rn, { mode: 'agent', fresh: true });
-        await sleep(1200);
-      }
-      let opened = '';
-      for (let i = 0; i < 12; i++) {
-        opened = await s.cdp.ev(OPEN_PICKER_JS);
-        if (opened === 'OK') break;
-        await sleep(1200);
-      }
-      if (opened !== 'OK') throw new Error('picker: ' + opened);
+      if (!s) { s = await getSession(rn, { mode: 'agent', fresh: true }); await sleep(2000); }
       let list = { items: [] };
-      for (let i = 0; i < 10; i++) {
-        await sleep(800);
+      const readList = async () => {
         const raw = await s.cdp.ev(LIST_REPOS_JS);
-        try { list = raw ? JSON.parse(raw) : { items: [] }; } catch (e) { list = { items: [] }; }
-        if (list.items && list.items.length) break;
+        try { return raw ? JSON.parse(raw) : { items: [] }; } catch (e) { return { items: [] }; }
+      };
+      list = await readList();
+      if (!(list.items && list.items.length)) {
+        let addPos = '';
+        for (let i = 0; i < 12; i++) {
+          addPos = await s.cdp.ev(ADD_BTN_POS_JS);
+          if (addPos && addPos.charAt(0) === '{') break;
+          addPos = '';
+          await sleep(800);
+        }
+        if (!addPos) throw new Error('\u9875\u9762\u4e0a\u627e\u4e0d\u5230\u300c+ \u6dfb\u52a0\u6587\u4ef6\u548c\u8fde\u63a5\u300d\u6309\u94ae');
+        await realClick(s.cdp, JSON.parse(addPos));
+        await sleep(1300);
+        let selPos = await s.cdp.ev(SEL_TAB_POS_JS);
+        if (!(selPos && selPos.charAt(0) === '{')) {
+          const ghItem = await s.cdp.ev(GH_ITEM_POS_JS);
+          if (ghItem && ghItem.charAt(0) === '{') { await realClick(s.cdp, JSON.parse(ghItem)); await sleep(1800); }
+        }
+        for (let i = 0; i < 10; i++) {
+          selPos = await s.cdp.ev(SEL_TAB_POS_JS);
+          if (selPos && selPos.charAt(0) === '{') { await realClick(s.cdp, JSON.parse(selPos)); break; }
+          await sleep(600);
+        }
+        await sleep(1200);
+        for (let i = 0; i < 12; i++) {
+          list = await readList();
+          if (list.items && list.items.length) break;
+          await sleep(700);
+        }
       }
+      if (!(list.items && list.items.length)) throw new Error('\u5f39\u5c42\u91cc\u6ca1\u8bfb\u5230\u4ed3\u5e93\u5217\u8868\uff08GitHub \u672a\u8fde\u63a5\uff1f\uff09');
       if (!want) {
         await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+        await sleep(500);
         return { repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
       }
-      const picked = await s.cdp.ev(pickRepoJs(want));
-      await sleep(900);
-      if (picked !== 'PICKED') throw new Error('pick: ' + picked + ' | available: ' + list.items.join(', '));
+      let pos = '';
+      for (let i = 0; i < 10; i++) {
+        pos = await s.cdp.ev(repoPosJs(want));
+        if (pos && pos.charAt(0) === '{') break;
+        pos = '';
+        await sleep(500);
+      }
+      if (!pos) throw new Error('\u5217\u8868\u91cc\u6ca1\u6709 ' + want + ' | available: ' + list.items.join(', '));
+      await realClick(s.cdp, JSON.parse(pos));
+      await sleep(1400);
+      if (await s.cdp.ev(DIALOG_OPEN_JS) === '1') {
+        await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+        await sleep(600);
+      }
       let chip = '';
-      for (let k = 0; k < 6; k++) { await sleep(700); chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip) break; }
+      for (let k = 0; k < 8; k++) { chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip === want) break; await sleep(700); }
       return { ok: true, repo: chip || want, repos: list.items };
     };
     return doRepo().then(r => { repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { require('fs').writeFileSync('F:/__AI__/work/repos.json', JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => send(500, { error: e.message }));

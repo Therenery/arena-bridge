@@ -250,6 +250,32 @@ async function waitReady(c) {
   throw new Error('page not ready (no composer)');
 }
 
+// 桥重启后别急着开新标签：优先接管已有的 arena 页面，历史才不会丢、标签才不会堆
+async function adoptTab(base) {
+  try {
+    const list = await cdpApi('GET', '/json/list');
+    if (!Array.isArray(list)) return null;
+    const used = new Set([...sessions.values()].map(x => x.tabId));
+    const want = 'https://arena.ai' + base;
+    const cand = list.filter(t => t.type === 'page' && String(t.url).indexOf(want) === 0 && !used.has(t.id));
+    if (!cand.length) return null;
+    const t = cand[0];
+    const c = await connectTab(t.id);
+    await c.send('Page.addScriptToEvaluateOnNewDocument', { source: INJECT }).catch(() => {});
+    await c.ev(INJECT).catch(() => {});
+    if (!(await c.ev(READY_JS).catch(() => false))) {
+      for (let i = 0; i < 10; i++) { await sleep(500); if (await c.ev(READY_JS).catch(() => false)) break; }
+    }
+    if (!(await c.ev(READY_JS).catch(() => false))) {
+      log('adopted tab has no composer, reloading');
+      await c.send('Page.reload', {}).catch(() => {});
+      await sleep(2500);
+    }
+    await waitReady(c);
+    return { tabId: t.id, cdp: c, url: t.url };
+  } catch (e) { log('adopt failed', e.message); return null; }
+}
+
 let lastMinAt = 0;
 function minimizeChrome() {
   const now = Date.now();
@@ -263,6 +289,12 @@ async function openTab(model, mode) {
   if (model && !/^arena-/.test(model)) q.push('model_a=' + encodeURIComponent(model));
   const base = mode === 'agent' ? '/agent' : '/text/direct';
   const url = 'https://arena.ai' + base + (q.length ? '?' + q.join('&') : '');
+  const adopted = await adoptTab(base);
+  if (adopted) {
+    log('adopted tab', adopted.tabId, String(adopted.url).slice(0, 60));
+    minimizeChrome();
+    return adopted;
+  }
   const tab = await cdpApi('PUT', '/json/new?' + encodeURIComponent('about:blank'));
   if (!tab || !tab.id) throw new Error('cannot create tab: ' + JSON.stringify(tab).slice(0, 120));
   const c = await connectTab(tab.id);

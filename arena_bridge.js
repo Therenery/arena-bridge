@@ -238,8 +238,34 @@ const EDITOR_SEL = `document.querySelector('textarea[name=message]')||document.q
 const READY_JS = `!!(${EDITOR_SEL})`;
 const VAL_JS = `(function(){var e=${EDITOR_SEL};if(!e)return 0;var v=(e.value!==undefined?e.value:(e.innerText||''));return String(v).replace(/[\s\u00a0\u200b]/g,'').length})()`;
 
-const RESUME_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /Close review/i.test(x.getAttribute('aria-label')||'')})[0];if(cs){cs.click();return 2}var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /^(继续工作|Continue working|Keep working)$/i.test((x.innerText||'').trim())})[0];if(b){b.click();return 1}return 0})()";
+const RESUME_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /close review/i.test(x.getAttribute('aria-label')||'')})[0];if(cs){cs.click();return 2}var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /^\\s*(关闭|Close)\\s*$/i.test((x.getAttribute('aria-label')||''))})[0];if(b){b.click();return 1}return 0})()";
 const REVIEW_JS = "(()=>{try{var t=(document.body&&document.body.innerText)||'';return t.indexOf('此任务成功了吗')>=0||t.indexOf('Did this task succeed')>=0}catch(e){return false}})()";
+
+// 一轮结束后 Arena 会弹「此任务成功了吗」面板，它把输入框整个顶掉；
+// 不关掉的话下一次提问会找不到 composer。只关面板，不重载页面。
+async function dismissReview(c) {
+  try {
+    if (!(await c.ev(REVIEW_JS))) return false;
+    const clicked = await c.ev(RESUME_JS).catch(() => 0);
+    if (!clicked) {
+      await c.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+      await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+    }
+    await sleep(900);
+    log('dismissed review panel', clicked ? 'button' : 'escape');
+    return true;
+  } catch (e) { return false; }
+}
+
+// 回合结束后面板要过一两秒才渲染出来，所以后台轮询，不拖慢响应。
+function dismissReviewSoon(c) {
+  (async () => {
+    for (let i = 0; i < 20; i++) {
+      if (await dismissReview(c)) return;
+      await sleep(500);
+    }
+  })().catch(() => {});
+}
 
 async function waitReady(c) {
   const t0 = Date.now();
@@ -247,12 +273,7 @@ async function waitReady(c) {
     if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
     if (await c.ev(READY_JS)) { await sleep(600); return; }
     if (await c.ev(REVIEW_JS)) {
-      log('review state, clicking resume');
-      const ok = await c.ev(RESUME_JS);
-      if (!ok) await c.ev("document.body.click()").catch(() => {});
-      await sleep(1500);
-      try { await c.send('Page.reload', {}); } catch (e) {}
-      await sleep(3500);
+      await dismissReview(c);
       continue;
     }
     await sleep(700);
@@ -262,6 +283,7 @@ async function waitReady(c) {
 
 // 桥重启后别急着开新标签：优先接管已有的 arena 页面，历史才不会丢、标签才不会堆
 async function adoptTab(base) {
+  let adoptTabId = null;
   try {
     const list = await cdpApi('GET', '/json/list');
     if (!Array.isArray(list)) return null;
@@ -269,21 +291,37 @@ async function adoptTab(base) {
     const want = 'https://arena.ai' + base;
     const cand = list.filter(t => t.type === 'page' && String(t.url).indexOf(want) === 0 && !used.has(t.id));
     if (!cand.length) return null;
-    const t = cand[0];
-    const c = await connectTab(t.id);
-    await c.send('Page.addScriptToEvaluateOnNewDocument', { source: INJECT }).catch(() => {});
-    await c.ev(INJECT).catch(() => {});
-    if (!(await c.ev(READY_JS).catch(() => false))) {
-      for (let i = 0; i < 10; i++) { await sleep(500); if (await c.ev(READY_JS).catch(() => false)) break; }
+    for (const t of cand) {
+      adoptTabId = t.id;
+      const c = await connectTab(t.id).catch(() => null);
+      if (!c) continue;
+      await c.send('Page.addScriptToEvaluateOnNewDocument', { source: INJECT }).catch(() => {});
+      await c.ev(INJECT).catch(() => {});
+      // A finished agent turn leaves the review panel open, which hides the
+      // composer; dismissing it is enough. Reloading a conversation tab
+      // wedges the page, so try every candidate before giving up.
+      for (let i = 0; i < 20; i++) {
+        if (await c.ev(READY_JS).catch(() => false)) break;
+        await dismissReview(c);
+        await sleep(500);
+      }
+      if (await c.ev(READY_JS).catch(() => false)) {
+        await sleep(600);
+        return { tabId: t.id, cdp: c, url: t.url };
+      }
+      log('adopt: tab not usable, closing', t.id);
+      try { await cdpApi('GET', '/json/close/' + t.id); } catch (e2) {}
     }
-    if (!(await c.ev(READY_JS).catch(() => false))) {
-      log('adopted tab has no composer, reloading');
-      await c.send('Page.reload', {}).catch(() => {});
-      await sleep(2500);
+    return null;
+  } catch (e) {
+    log('adopt failed', e.message);
+    // A tab we could not drive would otherwise linger forever; the profile
+    // is dedicated to the bridge, so close it rather than leak it.
+    if (adoptTabId) {
+      try { await cdpApi('GET', '/json/close/' + adoptTabId); log('closed unusable tab', adoptTabId); } catch (e2) {}
     }
-    await waitReady(c);
-    return { tabId: t.id, cdp: c, url: t.url };
-  } catch (e) { log('adopt failed', e.message); return null; }
+    return null;
+  }
 }
 
 let lastMinAt = 0;
@@ -567,6 +605,7 @@ async function askOnce(s, prompt, onDelta, ctx) {
     if (Date.now() - lastFrameAt > ASK_IDLE_MS) throw new Error('stalled: no frame for ' + Math.round(ASK_IDLE_MS / 1000) + 's');
   }
   if (!text.trim()) throw new Error('empty answer from upstream');
+  dismissReviewSoon(c);
   return { text, reasoning, routed, done, tools };
 }
 

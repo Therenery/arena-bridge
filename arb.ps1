@@ -21,6 +21,8 @@ try {
 } catch {
   $m = $_.Exception.Message
   if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $m = $m + ' | ' + $_.ErrorDetails.Message }
-  [IO.File]::WriteAllText($Out, ('{"ok":false,"error":"' + ($m -replace '"','\"') + '"}'), [Text.Encoding]::UTF8)
+  # 交给 ConvertTo-Json 转义：手拼 JSON 遇到反斜杠 / 换行 / 引号就会拼出坏 JSON，
+  # 客户端只能看到「传输异常」，真正的原因丢了
+  [IO.File]::WriteAllText($Out, (@{ ok = $false; error = $m } | ConvertTo-Json -Compress -Depth 4), [Text.Encoding]::UTF8)
   'ERR ' + $m
 }

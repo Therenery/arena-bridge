@@ -40,7 +40,14 @@ EOF
 case "${1:-}" in
   ""|tui|--tui)
     [ $# -gt 0 ] && shift
-    exec arena-codex "$@"
+    # Codex TUI 需要 Responses 适配器（17893）和 codex 二进制；缺任何一个就从这里掉进
+    # 「敲 arena 直接一行报错」的坑里，所以退回到能用的 REPL
+    if command -v arena-codex >/dev/null 2>&1 \
+       && { [ -x "${CODEX_BIN:-/root/.local/codex/codex}" ] || command -v codex >/dev/null 2>&1; }; then
+      exec arena-codex "$@"
+    fi
+    echo "未找到 Codex TUI，改用 REPL（arena chat）。装好 codex 后 arena 即进 TUI。" >&2
+    exec arena-chat "$@"
     ;;
   chat|repl|-i|--interactive)
     shift

@@ -27,7 +27,8 @@ const MAX_SESSIONS = Math.max(1, Number(process.env.ARB_MAX_SESSIONS) || 6);
 // 默认不打印 prompt 正文，也不落盘；排障时再开
 const DEBUG_PROMPT = /^(1|true|yes)$/i.test(process.env.ARB_DEBUG_PROMPT || '');
 // /upload 允许的目录白名单（path.delimiter 分隔）；留空表示不限制
-const UPLOAD_ROOTS = (process.env.ARB_UPLOAD_ROOTS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean);
+// 默认只允许状态目录与当前工作目录；要放开请显式设置 ARB_UPLOAD_ROOTS
+const UPLOAD_ROOTS = (process.env.ARB_UPLOAD_ROOTS || (STATE_DIR + path.delimiter + process.cwd())).split(path.delimiter).map(s => s.trim()).filter(Boolean);
 // SSE 心跳间隔，防止客户端在长时间工具调用时判定连接空闲
 const SSE_PING_MS = Math.max(1000, Number(process.env.ARB_SSE_PING_MS) || 15000);
 // 单次输入框能装的字符上限，超出会被截断（页面里逐字符敲，越长越慢）
@@ -133,7 +134,7 @@ const INJECT = String.raw`
   window.__arbStreams = [];
   const interesting = u => /nextjs-api\/stream|ai-proxy\/realtime/i.test(u);
   const push = (st, o) => {
-    try { st.frames.push(o); if (st.frames.length > 6000) st.frames.splice(0, 1500); } catch (e) {}
+    try { st.frames.push(o); if (st.frames.length > 30000) st.frames.splice(0, 10000); } catch (e) {}
   };
   const note = (st, line) => {
     try {
@@ -362,7 +363,7 @@ async function resetSession(name) {
 async function evictSessions(keepKey) {
   if (sessions.size < MAX_SESSIONS) return;
   const victims = [...sessions.entries()]
-    .filter(([k]) => k !== keepKey)
+    .filter(([k, s]) => k !== keepKey && !s.busy)
     .sort((a, b) => (a[1].lastAsk || 0) - (b[1].lastAsk || 0));
   while (sessions.size >= MAX_SESSIONS && victims.length) {
     const [k, s] = victims.shift();
@@ -492,15 +493,18 @@ async function askOnce(s, prompt, onDelta) {
       if (!r || r.gone) continue;
       if (r.f && r.f.length) {
         cursors.set(st.id, r.n); lastFrameAt = Date.now();
-        for (const f of r.f) parseLine(f);
+        for (const f of r.f) {
+          if (f.e === 'text-delta' || f.e === 'reasoning-delta' || f.e === 'tool-input-available' || (f.l && /^a[0-9]:/.test(f.l))) st.hasOut = true;
+          parseLine(f);
+        }
       }
-      if (r.done) anyDone = true;
+      if (r.done && st.hasOut) anyDone = true;
     }
     if (anyDone) doneSeen = true;
     if (done) break;
     if (doneSeen) {
       if (!doneNoTextAt) doneNoTextAt = Date.now();
-      if (text.trim() && Date.now() - lastFrameAt > 2000) { done = true; break; }
+      if (text.trim() && Date.now() - lastFrameAt > 8000) { done = true; break; }
       if (Date.now() - doneNoTextAt > 20000) throw new Error('stream ended with no text (session may be in review state)');
     }
     if (Date.now() - lastFrameAt > 150000) throw new Error('stalled: no frame for 150s');

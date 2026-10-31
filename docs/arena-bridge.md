@@ -9,7 +9,7 @@
 ### 交互式对话（推荐）
 
 ```bash
-arena                    # 进 REPL，Agent 模式，会话 main
+arena                    # 进 TUI（缺 codex 时自动退到 REPL），Agent 模式，会话 main
 arena chat -d            # Direct 模式
 arena chat -s 设计       # 独立会话「设计」
 ```
@@ -130,7 +130,7 @@ aichat -S -m arena:arena-direct "问题"        # 单发、非流式
 | 凭据 | 不读取、不存储、不外发任何 cookie 或 token |
 | reCAPTCHA | 完全不碰，由页面自己生成 |
 | 监听 | 只绑 127.0.0.1，不开公网 |
-| 并发 | 全局队列串行，队列上限 4 |
+| 并发 | 全局队列串行（同时只跑 1 个），排队上限 4 |
 | 频率 | 两次请求最小间隔 3 秒 |
 | 输入 | 逐字符 `dispatchKeyEvent` + 真实鼠标点击发送，页面看到的是人 |
 | 重试 | 失败不自动重试，避免触发风控 |
@@ -188,7 +188,7 @@ Get-Content F:\__AI__\tmp\arb.log -Tail 30
 
 | 文件 | 作用 |
 |---|---|
-| `arena` | 总入口：无参进 REPL，带问题走单发，另有 `chat/models/sessions/new/doctor` 子命令 |
+| `arena` | 总入口：无参进 TUI（缺 codex 时退到 REPL），带问题走单发，另有 `chat/models/sessions/new/doctor` 子命令 |
 | `arena-chat` | REPL 启动器：建隧道 → 体检 → `aichat -m arena:<model> -s <session>` |
 | `arena-send` | 单发实现：base64 → `pc` 调 `arb.ps1` → 取回 gzip 结果 → `jq` 输出 |
 | `arena-tunnel` | 三路隧道（tsnc → v6 → 直连），成功后把线路写进 `/tmp/.arena-tunnel-route` |

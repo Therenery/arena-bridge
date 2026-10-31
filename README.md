@@ -32,11 +32,13 @@ arena_bridge.js（node，无第三方依赖）
 | `arb.ps1` | Windows 侧调用入口，收 base64 问题、写结果 JSON |
 | `rd2.js` | 结果回传，gzip + base64 绕开 ssh 中文乱码 |
 | `start_bridge.ps1` / `start-arena-chrome.cmd` | 启动脚本，供计划任务调用 |
-| `cli/arena` | 总入口：无参进 REPL，带问题走单发，另有 `models/sessions/new/doctor` |
+| `cli/arena` | 总入口：无参进 TUI（缺 codex 时自动退到 REPL），带问题走单发，另有 `models/sessions/new/doctor` |
 | `cli/arena-chat` | REPL 启动器，建隧道 → 体检 → aichat |
 | `cli/arena-send` | 单发实现 |
 | `cli/arena-tunnel` | 三路隧道（tsnc / IPv6 / 直连），成功即返回 |
-| `cli/arena-responses` | Responses API → chat/completions 适配器，供 Codex CLI 使用 |
+| `cli/arena-responses` | **未实现（空文件）**，Codex CLI 需要的 Responses 适配器，见「已知限制」 |
+| `lib/parse.js` | 帧解析纯函数（a0/ag/a2/a3/ad + `records[]`），有 `node:test` 覆盖 |
+| `test/` | `npm test`，不需要 Chrome |
 
 ## 快速开始
 
@@ -59,7 +61,7 @@ model    = arena-agent（或 arena-direct）
 手机侧：
 
 ```bash
-arena                    # 进 REPL
+arena                    # 进 TUI（未装 codex 时自动退到 REPL）
 arena "问题"              # 单发
 arena -d "问题"           # Direct 模式
 arena doctor             # 隧道 / 桥接 / Chrome / 模型 体检
@@ -76,6 +78,9 @@ arena doctor             # 隧道 / 桥接 / Chrome / 模型 体检
 | `ARB_UPLOAD_ROOTS` | 空（不限制） | `/upload` 允许外发的目录白名单，`;`（Windows）或 `:` 分隔 |
 | `ARB_SSE_PING_MS` | `15000` | SSE 心跳间隔，防长任务被客户端判空闲 |
 | `ARB_DEBUG_PROMPT` | 关 | 设为 `1` 才把 prompt 正文写日志/落盘 |
+| `ARB_TOKEN` | 空（不校验） | 非空时所有接口（除 `/health`）要求 `Authorization: Bearer <token>` |
+| `ARB_MAX_PROMPT_CHARS` | `6000` | 单轮 prompt 字符上限，超出截断并在响应里标记 |
+| `ARB_MAX_HISTORY_KEYS` | `32` | 桥内部保存的会话历史条数上限（按键 LRU） |
 
 ## 安全设计
 
@@ -84,7 +89,9 @@ arena doctor             # 隧道 / 桥接 / Chrome / 模型 体检
 | 凭据 | 不读取、不存储、不外发任何 cookie 或 token |
 | reCAPTCHA | 完全不碰，由页面自己生成 |
 | 监听 | 只绑 127.0.0.1 |
-| 并发 | 全局队列串行，上限 4 |
+| 并发 | 全局队列串行（同时只跑 1 个），排队上限 4；队列满返回 429 |
+| 鉴权 | 可选 `ARB_TOKEN`；隧道场景建议开启 |
+| 取消 | 客户端断开后当前轮次立即停止，不再占着队列跑满 10 分钟 |
 | 频率 | 两次请求最小间隔 3 秒 |
 | 输入 | 真键盘事件，页面看到的是人 |
 | 重试 | 失败不自动重试，避免触发风控 |
@@ -96,7 +103,17 @@ arena doctor             # 隧道 / 桥接 / Chrome / 模型 体检
 2. 单轮耗时 40 秒到 5 分钟，取决于任务复杂度。
 3. 依赖页面结构：输入框是 ProseMirror（agent）或 textarea（direct），改版要跟着改选择器。
 4. 每个会话对应一个标签页，长期使用要清理。
-5. Arena 服务条款禁止以程序化方式访问服务，使用风险自负。
+5. `cli/arena-responses` 仍是空文件，Codex TUI 那条链路跑不起来（`arena-codex` 会直接报清楚原因）。
+6. `usage` 里的 token 数是字符数占位，不是真实 token；`tools` 目前只打印到思考区，没有映射成 `tool_calls`。
+7. Arena 服务条款禁止以程序化方式访问服务，使用风险自负。
+
+## 开发
+
+```bash
+npm test        # 帧解析单元测试，纯 node，不需要 Chrome
+```
+
+要求 node ≥ 21（用到全局 `WebSocket`）。
 
 ## 许可
 

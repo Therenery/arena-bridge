@@ -134,7 +134,7 @@ const INJECT = String.raw`
   window.__arbStreams = [];
   const interesting = u => /nextjs-api\/stream|ai-proxy\/realtime/i.test(u);
   const push = (st, o) => {
-    try { st.frames.push(o); if (st.frames.length > 30000) st.frames.splice(0, 10000); } catch (e) {}
+    try { st.frames.push(o); if (st.frames.length > 30000) { st.frames.splice(0, 10000); st.base = (st.base || 0) + 10000; } } catch (e) {}
   };
   const note = (st, line) => {
     try {
@@ -342,7 +342,7 @@ async function listStreams(c) {
   return v || [];
 }
 async function readFrames(c, sid, from) {
-  const v = await c.evJson("(function(){var s=(window.__arbStreams||[]).filter(function(x){return x.id===" + sid + "})[0];if(!s)return JSON.stringify({gone:true});return JSON.stringify({n:s.frames.length,done:!!s.done,f:s.frames.slice(" + from + ")})})()");
+  const v = await c.evJson("(function(){var s=(window.__arbStreams||[]).filter(function(x){return x.id===" + sid + "})[0];if(!s)return JSON.stringify({gone:true});var b=s.base||0;var rel=" + from + "-b;if(rel<0)rel=0;return JSON.stringify({n:b+s.frames.length,done:!!s.done,f:s.frames.slice(rel)})})()");
   return v;
 }
 

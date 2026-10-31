@@ -172,7 +172,7 @@ async function ensureChrome() {
 const VERIFY_JS = "(()=>{try{var t=document.body.innerText||'';return /Just a moment|Verify you are human|确认您是真人|Checking your browser|Attention Required/i.test(t)||!!document.querySelector('iframe[src*=challenges.cloudflare.com],#challenge-form,#challenge-stage')}catch(e){return false}})()";
 const EDITOR_SEL = `document.querySelector('textarea[name=message]')||document.querySelector('.ProseMirror[contenteditable="true"]')`;
 const READY_JS = `!!(${EDITOR_SEL})`;
-const VAL_JS = `(function(){var e=${EDITOR_SEL};if(!e)return 0;return (e.value!==undefined?e.value:(e.innerText||'')).length})()`;
+const VAL_JS = `(function(){var e=${EDITOR_SEL};if(!e)return 0;var v=(e.value!==undefined?e.value:(e.innerText||''));return String(v).replace(/[\s\u00a0\u200b]/g,'').length})()`;
 
 const RESUME_JS = "(function(){var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /继续工作|Continue working|Keep working|Continue/i.test((x.innerText||'').trim())})[0];if(b){b.click();return 1}return 0})()";
 const REVIEW_JS = "(()=>{try{var t=(document.body&&document.body.innerText)||'';return t.indexOf('此任务成功了吗')>=0||t.indexOf('Did this task succeed')>=0}catch(e){return false}})()";
@@ -185,6 +185,10 @@ async function waitReady(c) {
     if (await c.ev(REVIEW_JS)) {
       log('review state, clicking resume');
       const ok = await c.ev(RESUME_JS);
+      await sleep(1500);
+      try { await c.send('Page.reload', {}); } catch (e) {}
+      await sleep(3500);
+      continue;
       await sleep(2500);
       if (!ok) { await c.ev("document.body.click()"); await sleep(800); }
       continue;
@@ -215,28 +219,68 @@ async function keyCombo(c, modifiers, key, code, vk) {
   await c.send('Input.dispatchKeyEvent', { type: 'keyUp', modifiers, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
 }
 
+async function waitIdle(c, quietMs, maxMs) {
+  const q = quietMs || 1200, m = maxMs || 20000;
+  const t0 = Date.now();
+  let lastActive = Date.now();
+  while (Date.now() - t0 < m) {
+    const ls = (await listStreams(c)) || [];
+    const active = ls.filter(x => !x.done);
+    if (active.length) lastActive = Date.now();
+    else if (Date.now() - lastActive >= q) return true;
+    await sleep(300);
+  }
+  return false;
+}
+
+const SEND_JS = "(function(){var e=" + EDITOR_SEL + ";if(!e)return '';var bs=[].slice.call(document.querySelectorAll('button'));var f=bs.filter(function(b){return /send/i.test(b.getAttribute('aria-label')||'')});if(!f.length){var r=e.getBoundingClientRect();f=bs.filter(function(b){var q=b.getBoundingClientRect();return q.width>2&&q.height>2&&q.left>r.left+r.width*0.55&&q.top>r.top-20&&q.top<r.bottom+100})}if(!f.length)return '';var b=f[0];var q=b.getBoundingClientRect();if(q.width<2)return '';return JSON.stringify({x:Math.round(q.left+q.width/2),y:Math.round(q.top+q.height/2),dis:!!(b.disabled||b.getAttribute('aria-disabled')==='true')})})()";
+
+async function clickSend(c) {
+  const ST = "(function(){var bs=[].slice.call(document.querySelectorAll('button'));var s=bs.filter(function(b){return /send/i.test(b.getAttribute('aria-label')||'')})[0];if(!s)return '';var q=s.getBoundingClientRect();var pe=getComputedStyle(s).pointerEvents;return JSON.stringify({x:Math.round(q.left+q.width/2),y:Math.round(q.top+q.height/2),pe:pe})})()";
+  for (let i = 0; i < 20; i++) {
+    const raw = await c.ev(ST);
+    if (raw && raw.charAt(0) === '{') {
+      const p = JSON.parse(raw);
+      if (p.pe !== 'none') {
+        await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: 'none', buttons: 0 });
+        await sleep(80);
+        await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', buttons: 1, clickCount: 1 });
+        await sleep(80);
+        await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: 0, clickCount: 1 });
+        await sleep(900);
+        const left = await c.ev(VAL_JS);
+        if (left <= 1) return true;
+      }
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
 async function typePrompt(c, text) {
-  await c.ev(`(function(){var e=${EDITOR_SEL};if(e)e.focus()})()`);
-  await sleep(150);
+  await sleep(800);
+  const pos = await c.evJson("(function(){var e=" + EDITOR_SEL + ";if(!e)return null;e.focus();var r=e.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()");
+  if (pos && pos.x) {
+    await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+    await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+    await sleep(250);
+  }
   await keyCombo(c, 2, 'a', 'KeyA', 65);
-  await sleep(100);
+  await sleep(80);
   await keyCombo(c, 0, 'Backspace', 'Backspace', 8);
-  await sleep(150);
-  await c.send('Input.insertText', { text });
-  await sleep(400);
+  await sleep(250);
+  const body = text.slice(0, 6000);
+  for (let i = 0; i < body.length; i++) {
+    await c.send('Input.dispatchKeyEvent', { type: 'char', text: body.charAt(i) });
+    if (i % 25 === 24) await sleep(20);
+  }
+  await sleep(700);
   const n = await c.ev(VAL_JS);
   if (!n) throw new Error('typing failed (editor empty after insert)');
-  for (const type of ['rawKeyDown', 'char', 'keyUp']) {
-    await c.send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: type === 'char' ? '\r' : undefined, unmodifiedText: type === 'char' ? '\r' : undefined });
-  }
-  await sleep(400);
-  const left = await c.ev(VAL_JS);
-  if (left > 0) {
-    // fallback: click the send button
-    await c.ev("(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){var l=(x.getAttribute('aria-label')||'')+(x.innerText||'');return /send|Send|提交|发送/.test(l)});if(b[0])b[0].click();return !!b[0]})()");
-    await sleep(500);
-  }
+  const ok = await clickSend(c);
+  if (!ok) throw new Error('send failed (composer still holds text)');
 }
+
 
 /* ---------- stream reading ---------- */
 async function listStreams(c) {
@@ -272,6 +316,8 @@ async function askOnce(s, prompt, onDelta) {
   const c = s.cdp;
   if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
   if (!(await c.ev(READY_JS))) { await waitReady(c); }
+  await waitConversation(c);
+  await waitIdle(c);
   const preList = (await listStreams(c)) || [];
   const pre = new Map(preList.map(x => [x.id, x.n]));
   const sendTs = Date.now();
@@ -354,7 +400,7 @@ async function askOnce(s, prompt, onDelta) {
     if (done) break;
     if (doneSeen) {
       if (!doneNoTextAt) doneNoTextAt = Date.now();
-      if (text.trim()) { done = true; break; }
+      if (text.trim() && Date.now() - lastFrameAt > 2000) { done = true; break; }
       if (Date.now() - doneNoTextAt > 20000) throw new Error('stream ended with no text (session may be in review state)');
     }
     if (Date.now() - lastFrameAt > 150000) throw new Error('stalled: no frame for 150s');
@@ -459,12 +505,13 @@ const server = http.createServer(async (req, res) => {
   if ((u.pathname === '/v1/chat/completions' || u.pathname === '/chat/completions') && req.method === 'POST') {
     let body;
     try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: { message: 'bad json', type: 'invalid_request_error' } }); }
+const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x && typeof x === 'object' ? String(x.text || x.content || '') : String(x || '')).join('') : (c == null ? '' : String(c));
     const msgs = Array.isArray(body.messages) ? body.messages : [];
-    const sys = msgs.filter(m => m && m.role === 'system').map(m => String(m.content || '')).join('\n\n');
+    const sys = msgs.filter(m => m && m.role === 'system').map(m => ctext(m.content)).join('\n\n');
     log('v1 msgs=' + msgs.length + ' roles=' + msgs.map(m => m && m.role).join(','));
     const prior = msgs.filter(m => m && m.role !== 'system' && m.content);
     if (!prior.length) return send(400, { error: { message: 'no user message', type: 'invalid_request_error' } });
-    const last = String(prior[prior.length - 1].content || '');
+    const last = ctext(prior[prior.length - 1].content);
     const name = body.user || body.session || 'main';
     const bodyPrior = prior.length > 1 ? prior.slice(0, -1) : null;
     const srvPrior = histories.get(name) || [];
@@ -472,11 +519,17 @@ const server = http.createServer(async (req, res) => {
     const useHist = fresh ? (bodyPrior && bodyPrior.length ? bodyPrior : (srvPrior.length ? srvPrior : null)) : null;
     let prompt = last;
     if (useHist) {
-      const hist = useHist.map(m => (m.role === 'assistant' ? '助手' : '用户') + '：' + String(m.content)).join('\n\n');
+      const hist = useHist.map(m => (m.role === 'assistant' ? '助手' : '用户') + '：' + ctext(m.content)).join('\n\n');
       prompt = '以下是本次对话之前的记录，请接着最后一条继续回答，不要复述历史。\n\n【对话记录】\n' + hist + '\n\n【当前问题】\n' + last;
     }
-    if (sys) prompt = sys + '\n\n' + prompt;
+    const dropSys = String(req.headers['x-arena-drop-system'] || '') === '1';
+    // Arena 自带系统提示词，客户端的一律不转发
+    const CTX_RE = /-{3}[^\n]*Context from:[\s\S]*?End of Context from:[^\n]*\n?-{0,3}/g;
+    if (CTX_RE.test(prompt)) { prompt = prompt.replace(CTX_RE, ''); log('ctx stripped -> ' + prompt.length); }
+    prompt = prompt.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').replace(/<\/?[a-z-]+-[a-z-]+>/g, '').replace(/\n{3,}/g, '\n\n').trim();
     if (!prompt.trim()) return send(400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
+    log('PROMPT len=' + prompt.length + ' head=' + prompt.slice(0, 200).replace(/[\r\n]+/g, ' '));
+    try { require('fs').writeFileSync('F:/__AI__/work/last-prompt.txt', prompt); } catch (e) {}
     const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', fresh };
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
@@ -585,3 +638,15 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => log('listening http://' + HOST + ':' + PORT));
 process.on('uncaughtException', e => log('uncaught', e.message));
 process.on('unhandledRejection', e => log('unhandled', e && e.message));
+
+async function waitConversation(c, maxMs) {
+  const t0 = Date.now();
+  const lim = maxMs || 25000;
+  while (Date.now() - t0 < lim) {
+    const u = String((await c.ev('location.href')) || '');
+    if (/\/agent\/[0-9a-f-]{8,}/i.test(u)) return true;
+    await sleep(500);
+  }
+  return false;
+}
+

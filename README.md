@@ -17,7 +17,7 @@ arena_bridge.js（node，无第三方依赖）
    │
    ├─ CDP → Chrome 9222
    │    ├─ Page.addScriptToEvaluateOnNewDocument 注入拦截脚本
-   │    └─ Input.insertText + Enter 模拟真人输入
+   │    └─ 逐字符 keyDown + 真实鼠标点击（tiptap 只认这条路径）
    │
    └─ 旁路 clone 页面自己的 fetch 流
         ├─ direct：/nextjs-api/stream/create-evaluation   a0: 正文  ag: 思考  ad: 结束
@@ -110,4 +110,61 @@ arena repos                    # 列出页面里可选的 GitHub 仓库
 arena repo Therenery/Backrooms # 切换工作区仓库（等于开新对话）
 arena chat -R Therenery/xxx    # 进 REPL 前先切
 ```
+
+## Arena Code：Windows 终端界面（Qwen Code）
+
+终端这一层用 Qwen Code 的 TUI 当外壳（Apache-2.0，自带 OpenAI 兼容 provider），只把它当键盘和显示器：提示词、工具调用一律不参与，真正干活的是 Arena 页面里的 Agent。
+
+### 为什么不是 Codex
+
+Codex 的 TUI 按固定宽度排版，Termux 88 列下会崩；Qwen Code 的 TUI 能自适应，且 packages/core/src/core/openaiContentGenerator/ 已经内置 OpenAI 兼容实现，接桥只需配 base_url。
+
+### 客户端配置
+
+%USERPROFILE%\.qwen\settings.json：
+
+~~~json
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "arena-agent",
+        "name": "Arena Agent",
+        "baseUrl": "http://127.0.0.1:17892/v1",
+        "envKey": "ARENA_API_KEY"
+      }
+    ]
+  },
+  "model": { "name": "arena-agent", "baseUrl": "http://127.0.0.1:17892/v1" },
+  "security": { "auth": { "selectedType": "openai" } },
+  "env": { "ARENA_API_KEY": "sk-arena-local" }
+}
+~~~
+
+cli-windows\arena.cmd 放进 PATH（例如 E:\Programz\bin），敲 arena 即进界面：
+
+- 体检 17892，没起来就拉起 arena_bridge.js
+- QWEN_SYSTEM_MD 指向空文件，客户端不再自带系统提示词
+- 工作目录切到空目录，避免把 AGENTS.md 之类带进对话
+
+### 发送机制（踩过的坑）
+
+Arena 的输入框是 tiptap/ProseMirror。只有逐字符的真实键盘事件会更新它的内部状态：
+
+| 方式 | 输入框有字 | 发送按钮 | 能否发出 |
+|---|---|---|---|
+| Input.insertText | 是 | pointer-events:none、半透明 | 否 |
+| execCommand('insertText') | 是 | 同上 | 否 |
+| Input.dispatchKeyEvent{type:'char'} 逐字符 | 是 | 可用 | 是 |
+
+所以 typePrompt() 逐字符发 char 事件，clickSend() 先看按钮 pointer-events 是否为 none，再用真实鼠标事件点它。
+
+另外两个必须清掉的东西：
+
+- 客户端的 system 消息：Arena 页面自带系统提示词，客户端再塞一份会互相打架，桥里直接丢弃。
+- 客户端注入的上下文：Qwen Code 会往 user 消息里塞 --- Context from: ... --- 和 <system-reminder>，一次两万字，Arena 只会回一句「需要我做什么」。桥里用正则剥掉。
+
+### 新会话
+
+新会话就是导航到 https://arena.ai/agent （不带会话 id）。仓库/连接器选择是账号级状态，新会话自动继承，/repo 只在需要换库时用。
 

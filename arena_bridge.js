@@ -185,7 +185,7 @@ const EDITOR_SEL = `document.querySelector('textarea[name=message]')||document.q
 const READY_JS = `!!(${EDITOR_SEL})`;
 const VAL_JS = `(function(){var e=${EDITOR_SEL};if(!e)return 0;var v=(e.value!==undefined?e.value:(e.innerText||''));return String(v).replace(/[\s\u00a0\u200b]/g,'').length})()`;
 
-const RESUME_JS = "(function(){var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /继续工作|Continue working|Keep working|Continue/i.test((x.innerText||'').trim())})[0];if(b){b.click();return 1}return 0})()";
+const RESUME_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /Close review/i.test(x.getAttribute('aria-label')||'')})[0];if(cs){cs.click();return 2}var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /^(继续工作|Continue working|Keep working)$/i.test((x.innerText||'').trim())})[0];if(b){b.click();return 1}return 0})()";
 const REVIEW_JS = "(()=>{try{var t=(document.body&&document.body.innerText)||'';return t.indexOf('此任务成功了吗')>=0||t.indexOf('Did this task succeed')>=0}catch(e){return false}})()";
 
 async function waitReady(c) {
@@ -389,7 +389,7 @@ async function askOnce(s, prompt, onDelta) {
         else if (d.type === 'reasoning-delta') { const t = d.delta || ''; if (t) { reasoning += t; onDelta && onDelta({ type: 'reasoning', text: t }); } }
         else if (d.type === 'tool-input-available') { tools.push({ name: d.toolName, input: d.input }); onDelta && onDelta({ type: 'tool', name: d.toolName, input: d.input }); }
         else if (d.type === 'finish') { done = true; }
-        else if (d.type === 'error') { const err = new Error('agent: ' + JSON.stringify(d).slice(0, 300)); err.fatal = true; throw err; }
+        else if (d.type === 'error') { const err = new Error('Arena rejected the turn, please resend: ' + JSON.stringify(d).slice(0, 200)); err.fatal = true; throw err; }
       }
     }
   };
@@ -523,7 +523,9 @@ const server = http.createServer(async (req, res) => {
       const picked = await s.cdp.ev(pickRepoJs(want));
       await sleep(900);
       if (picked !== 'PICKED') throw new Error('pick: ' + picked + ' | available: ' + list.items.join(', '));
-      return { ok: true, repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
+      let chip = '';
+      for (let k = 0; k < 6; k++) { await sleep(700); chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip) break; }
+      return { ok: true, repo: chip || want, repos: list.items };
     };
     return doRepo().then(r => { repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { require('fs').writeFileSync('F:/__AI__/work/repos.json', JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => send(500, { error: e.message }));
   }

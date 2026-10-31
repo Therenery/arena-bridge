@@ -773,6 +773,23 @@ const server = http.createServer(async (req, res) => {
       send(200, r);
     }).catch(e => { minimizeChrome(); send(e && e.busy ? 429 : 500, { error: e.message }); });
   }
+  if (u.pathname === '/pr') {
+    const repo = (u.searchParams.get('repo') || repoCache.repo || '').trim();
+    const num = (u.searchParams.get('n') || '').trim();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return send(400, { error: 'no repo selected' });
+    if (num && !/^[0-9]+$/.test(num)) return send(400, { error: 'bad pull request number' });
+    const ghArgs = num
+      ? `pr view ${num} --repo ${repo} --json number,title,state,isDraft,mergeable,reviewDecision,url,headRefName,baseRefName,additions,deletions,changedFiles`
+      : `pr list --repo ${repo} --state all --limit 20 --json number,title,state,isDraft,url,headRefName,updatedAt`;
+    return exec(`gh ${ghArgs}`, { timeout: 30000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return send(500, { error: (stderr || err.message || 'gh failed').trim().slice(0, 400) });
+      let data = null;
+      try { data = JSON.parse(stdout); } catch (e) { return send(500, { error: 'unparsable gh output' }); }
+      if (num) return send(200, { repo, pr: data });
+      return send(200, { repo, prs: data });
+    });
+  }
+
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;
     try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: 'bad json' }); }

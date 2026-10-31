@@ -20,6 +20,8 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ---------- repo picker ---------- */
+let repoCache = { repo: "", repos: [] };
+try { repoCache = JSON.parse(require("fs").readFileSync("F:/__AI__/work/repos.json", "utf8")); } catch (e) {}
 const OPEN_PICKER_JS = "(function(){var fire=function(el){var r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;var o={bubbles:true,cancelable:true,clientX:x,clientY:y,view:window,button:0,buttons:1,pointerId:1,isPrimary:true,pointerType:'mouse'};el.dispatchEvent(new PointerEvent('pointerdown',o));el.dispatchEvent(new MouseEvent('mousedown',o));el.dispatchEvent(new PointerEvent('pointerup',o));el.dispatchEvent(new MouseEvent('mouseup',o));el.dispatchEvent(new MouseEvent('click',o));};var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];if(b){fire(b);return 'OK'}var g=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return (x.getAttribute('aria-label')||'')==='GitHub'})[0];if(g){fire(g);return 'CLICKED_GITHUB'}return 'NO_CHIP'})()";
 const LIST_REPOS_JS = "(function(){var d=document.querySelector('[role=dialog]');if(!d)return JSON.stringify({open:false,items:[]});var items=[].slice.call(d.querySelectorAll('button,[role=option]')).map(function(x){return (x.innerText||'').trim()}).filter(function(t){return /^[\\w.-]+\\/[\\w.-]+$/.test(t)});return JSON.stringify({open:true,items:items})})()";
 const CHIP_TEXT_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];return b?(b.innerText||'').trim():''})()";
@@ -492,6 +494,7 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname === '/repos' || u.pathname === '/repo') {
     const rn = u.searchParams.get('session') || 'main';
     const want = u.searchParams.get('name') || '';
+    if (u.searchParams.get('cached')) return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
     const doRepo = async () => {
       let s = sessions.get(rn);
       if (!s || want) {
@@ -522,7 +525,7 @@ const server = http.createServer(async (req, res) => {
       if (picked !== 'PICKED') throw new Error('pick: ' + picked + ' | available: ' + list.items.join(', '));
       return { ok: true, repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
     };
-    return doRepo().then(r => send(200, r)).catch(e => send(500, { error: e.message }));
+    return doRepo().then(r => { repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { require('fs').writeFileSync('F:/__AI__/work/repos.json', JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => send(500, { error: e.message }));
   }
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;

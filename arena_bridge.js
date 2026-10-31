@@ -31,13 +31,14 @@ async function realClick(c, p) {
 }
 const CHIP_POS_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){var t=(x.innerText||'').trim();return t.length>2&&t.length<60&&t.indexOf('/')>0&&t.indexOf(' ')<0})[0];if(!b)return '';var r=b.getBoundingClientRect();if(!r.width)return '';return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()";
 const ADD_BTN_POS_JS = "(function(){var es=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /Add files and connections/i.test(x.getAttribute('aria-label')||'')});for(var i=0;i<es.length;i++){var r=es[i].getBoundingClientRect();if(r.width>0&&r.height>0)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
-const SEL_TAB_POS_JS = "(function(){var es=[].slice.call(document.querySelectorAll('span,button,div,a'));for(var i=0;i<es.length;i++){var e=es[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='Select a repository')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
-const GH_ITEM_POS_JS = "(function(){var best=null,by=-1;[].slice.call(document.querySelectorAll('span,button,div')).forEach(function(e){if(e.children.length>1)return;if((e.innerText||'').trim()!=='GitHub')return;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)return;if(r.top>by){by=r.top;best=r}});if(!best)return '';return JSON.stringify({x:Math.round(best.left+best.width/2),y:Math.round(best.top+best.height/2)})})()";
+const SEL_TAB_POS_JS = "(function(){function inOpen(e){var p=e;for(var i=0;i<8&&p;i++){var st=p.getAttribute&&p.getAttribute('data-state');if(st==='open')return true;p=p.parentElement}return false}var els=[].slice.call(document.querySelectorAll('span,button,div'));for(var i=els.length-1;i>=0;i--){var e=els[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='Select a repository')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;if(!inOpen(e))continue;var px=Math.round(r.left+r.width/2),py=Math.round(r.top+r.height/2);var h=document.elementFromPoint(px,py);for(var k=0;k<4&&h;k++){if((h.innerText||'').trim()==='Select a repository')return JSON.stringify({x:px,y:py});h=h.parentElement}}return ''})()";
+const OUTER_GH_POS_JS = "(function(){var best=null;[].slice.call(document.querySelectorAll('span,button,div')).forEach(function(e){if(e.children.length>1)return;if((e.innerText||'').trim()!=='GitHub')return;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)return;var q=e,st='';for(var i=0;i<8&&q;i++){var s=q.getAttribute&&q.getAttribute('data-state');if(s){st=s;break}q=q.parentElement}if(st==='open')return;var px=Math.round(r.left+r.width/2),py=Math.round(r.top+r.height/2);var h=document.elementFromPoint(px,py);for(var k=0;k<4&&h;k++){if((h.innerText||'').trim()==='GitHub'){best={x:px,y:py};return}h=h.parentElement}});return best?JSON.stringify(best):''})()";
+const GH_ITEM_POS_JS = "(function(){function inOpen(e){var p=e;for(var i=0;i<8&&p;i++){var st=p.getAttribute&&p.getAttribute('data-state');if(st==='open')return true;p=p.parentElement}return false}var els=[].slice.call(document.querySelectorAll('span,button,div'));var anchor=null;for(var i=0;i<els.length;i++){var e=els[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='Connectors')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;if(!inOpen(e))continue;anchor=r;break}if(!anchor)return '';for(var j=0;j<els.length;j++){var x=els[j];if(x.children.length>1)continue;if((x.innerText||'').trim()!=='GitHub')continue;var q=x.getBoundingClientRect();if(q.width<4||q.height<4)continue;if(Math.abs(q.top-anchor.top)>12)continue;var px=Math.round(q.left+q.width/2),py=Math.round(q.top+q.height/2);var h=document.elementFromPoint(px,py);for(var k=0;k<4&&h;k++){if((h.innerText||'').trim()==='GitHub')return JSON.stringify({x:px,y:py});h=h.parentElement}break}return ''})()";
 const DIALOG_OPEN_JS = "(function(){var d=document.querySelector('[role=dialog],[role=menu]');return d?'1':'0'})()";
 const OPEN_PICKER_JS = "(function(){var fire=function(el){var r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;var o={bubbles:true,cancelable:true,clientX:x,clientY:y,view:window,button:0,buttons:1,pointerId:1,isPrimary:true,pointerType:'mouse'};el.dispatchEvent(new PointerEvent('pointerdown',o));el.dispatchEvent(new MouseEvent('mousedown',o));el.dispatchEvent(new PointerEvent('pointerup',o));el.dispatchEvent(new MouseEvent('mouseup',o));el.dispatchEvent(new MouseEvent('click',o));};var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];if(b){fire(b);return 'OK'}var g=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return (x.getAttribute('aria-label')||'')==='GitHub'})[0];if(g){fire(g);return 'CLICKED_GITHUB'}return 'NO_CHIP'})()";
 const LIST_REPOS_JS = "(function(){var d=document.querySelector('[role=dialog],[role=menu]');if(!d)return JSON.stringify({open:false,items:[]});var out=[];[].slice.call(d.querySelectorAll('*')).forEach(function(x){if(x.children.length>2)return;var t=(x.innerText||'').trim();if(!/^[\\w.-]+\\/[\\w.-]+$/.test(t))return;if(out.indexOf(t)<0)out.push(t)});return JSON.stringify({open:true,items:out})})()";
 const CHIP_TEXT_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];return b?(b.innerText||'').trim():''})()";
-const repoPosJs = name => "(function(){var d=document.querySelector('[role=dialog],[role=menu]');if(!d)return '';var es=[].slice.call(d.querySelectorAll('*')).filter(function(x){return (x.innerText||'').trim()===" + JSON.stringify(name) + " && x.children.length<=2});for(var i=0;i<es.length;i++){var r=es[i].getBoundingClientRect();if(r.width>4&&r.height>4)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
+const repoPosJs = name => "(function(){var d=document.querySelector('[role=dialog]');if(!d)return '';var cs=[];[].slice.call(d.querySelectorAll('*')).forEach(function(e){if((e.innerText||'').trim()!==" + JSON.stringify(name) + ")return;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)return;if(r.top<0||r.bottom>innerHeight)return;cs.push(r)});for(var i=0;i<cs.length;i++){var r=cs[i],x=Math.round(r.left+r.width/2),y=Math.round(r.top+r.height/2);var h=document.elementFromPoint(x,y);for(var k=0;k<5&&h;k++){if((h.innerText||'').trim()===" + JSON.stringify(name) + ")return JSON.stringify({x:x,y:y});h=h.parentElement}}return ''})()";
 
 /* ---------- CDP plumbing ---------- */
 function cdpApi(method, path) {
@@ -548,30 +549,20 @@ const server = http.createServer(async (req, res) => {
       if (!(list.items && list.items.length)) {
         await escKey();
         let addPos = '';
-        for (let i = 0; i < 12; i++) {
-          addPos = await s.cdp.ev(ADD_BTN_POS_JS);
+        for (let i = 0; i < 14; i++) {
+          addPos = await s.cdp.ev(OUTER_GH_POS_JS);
           if (addPos && addPos.charAt(0) === '{') break;
           addPos = '';
-          await sleep(800);
+          await sleep(600);
         }
-        if (!addPos) throw new Error('\u9875\u9762\u4e0a\u627e\u4e0d\u5230\u300c+ \u6dfb\u52a0\u6587\u4ef6\u548c\u8fde\u63a5\u300d\u6309\u94ae');
+        if (!addPos) throw new Error('\u627e\u4e0d\u5230\u8f93\u5165\u6846\u4e0b\u65b9\u7684 GitHub \u6309\u94ae');
         await realClick(s.cdp, JSON.parse(addPos));
-        await sleep(1300);
+        log('clicked outer GitHub');
+        await sleep(1800);
         let selPos = '';
-        let ghClicked = false;
-        for (let i = 0; i < 16; i++) {
+        for (let i = 0; i < 12; i++) {
           selPos = await s.cdp.ev(SEL_TAB_POS_JS);
           if (selPos && selPos.charAt(0) === '{') break;
-          if (!ghClicked) {
-            const ghItem = await s.cdp.ev(GH_ITEM_POS_JS);
-            if (ghItem && ghItem.charAt(0) === '{') {
-              log('clicked GitHub menu item');
-              await realClick(s.cdp, JSON.parse(ghItem));
-              ghClicked = true;
-              await sleep(1500);
-              continue;
-            }
-          }
           await sleep(700);
         }
         if (selPos && selPos.charAt(0) === '{') { await realClick(s.cdp, JSON.parse(selPos)); await sleep(1500); }

@@ -8,8 +8,9 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -34,8 +35,17 @@ const UPLOAD_ROOTS = (process.env.ARB_UPLOAD_ROOTS || (STATE_DIR + path.delimite
 const SSE_PING_MS = Math.max(1000, Number(process.env.ARB_SSE_PING_MS) || 15000);
 // 单次输入框能装的字符上限，超出会被截断（页面里逐字符敲，越长越慢）
 const MAX_PROMPT_CHARS = Math.max(500, Number(process.env.ARB_MAX_PROMPT_CHARS) || 6000);
+// 可选鉴权：隧道把端口曝到手机上时，靠它挡住同机其它进程；留空即不校验
+const AUTH_TOKEN = process.env.ARB_TOKEN || '';
+// histories 的键上限，避免客户端换着 user 字段把内存撑爆
+const MAX_HISTORY_KEYS = Math.max(4, Number(process.env.ARB_MAX_HISTORY_KEYS) || 32);
+// 各接口统一的默认会话名，别让 /ask 和 /v1 各叫一个名字
+const DEFAULT_SESSION = 'main';
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+
+// 哪些错误说明标签页本身坏了（要关掉重开）；超时、队列满这类不该顺手杀会话
+const sessionBroken = msg => /composer still holds|send failed|page not ready|ws closed|tab closed|no composer|typing failed/.test(String(msg || ''));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // 路径是否落在任一白名单目录内（解析软链后再比，避免 ../ 绕过）
@@ -396,7 +406,9 @@ async function stopGeneration(c) {
 }
 /* ---------- stream reading ---------- */
 async function listStreams(c) {
-  const v = await c.evJson("(function(){return JSON.stringify((window.__arbStreams||[]).map(function(s){return {id:s.id,u:s.u,t:s.t,n:s.frames.length,done:!!s.done}}))})()");
+  // n 是绝对帧号（base + 本流帧数），和 readFrames 返回的 n 同一坐标系；
+  // 之前这里用的是相对帧数，流被裁剪过（base>0）时游标会对不上，正文重复一遍
+  const v = await c.evJson("(function(){return JSON.stringify((window.__arbStreams||[]).map(function(s){return {id:s.id,u:s.u,t:s.t,n:(s.base||0)+s.frames.length,done:!!s.done}}))})()");
   return v || [];
 }
 async function readFrames(c, sid, from) {
@@ -407,14 +419,24 @@ async function readFrames(c, sid, from) {
 /* ---------- session ---------- */
 const sessions = new Map();
 const histories = new Map();
+// 标签页被关掉/重建后，页面自己的上下文没了；下一条请求要把服务端历史补进 prompt，
+// 否则对话中途遇到一次错误就悄悄失忆，用户只会觉得「它怎么忘了刚才说的」
+const contextLost = new Set();
 
-async function resetSession(name) {
+function setHistory(name, h) {
+  histories.delete(name);
+  histories.set(name, h);
+  while (histories.size > MAX_HISTORY_KEYS) histories.delete(histories.keys().next().value);
+}
+
+async function resetSession(name, why) {
   const s = sessions.get(name);
   if (!s) return;
   try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {}
   try { s.cdp.close(); } catch (e) {}
   sessions.delete(name);
-  log('session reset ' + name);
+  if (histories.has(name)) contextLost.add(name);
+  log('session reset ' + name + (why ? ' (' + why + ')' : ''));
 }
 
 // 标签页堆积是长期使用的主要痛点：超过上限就淘汰最久未用的一条
@@ -434,13 +456,15 @@ async function evictSessions(keepKey) {
 }
 
 async function getSession(name, opts) {
-  const key = name || 'default';
+  const key = name || DEFAULT_SESSION;
   let s = sessions.get(key);
   if (s && opts.fresh) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(key); s = null; }
   if (s) {
     const alive = await s.cdp.ev("1+1").catch(() => null);
     if (alive === 2) return s;
+    log('tab for ' + key + ' is gone, reopening');
     sessions.delete(key); s = null;
+    if (histories.has(key)) contextLost.add(key);
   }
   if (!(await ensureChrome())) throw new Error('chrome unavailable');
   await evictSessions(key);
@@ -460,8 +484,9 @@ async function getSession(name, opts) {
 }
 
 /* ---------- ask ---------- */
-async function askOnce(s, prompt, onDelta) {
+async function askOnce(s, prompt, onDelta, ctx) {
   const c = s.cdp;
+  const aborted = () => !!(ctx && ctx.aborted && ctx.aborted());
   if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
   if (!(await c.ev(READY_JS))) { await waitReady(c); }
   if (await isGenerating(c)) {
@@ -476,61 +501,31 @@ async function askOnce(s, prompt, onDelta) {
   const sendTs = Date.now();
   await typePrompt(c, prompt);
   const t0 = Date.now();
-  let text = '', reasoning = '', done = false, routed = [], tick = 0, doneNoTextAt = 0, doneSeen = false;
+  let text = '', reasoning = '', done = false, routed = '', tick = 0, doneNoTextAt = 0, doneSeen = false;
   const cursors = new Map();
   const tools = [];
   let lastFrameAt = Date.now();
 
-  const parseLine = f => {
-    if (f.e) {
-      const t = f.d || '';
-      if (f.e === 'text-delta') { if (t) { text += t; onDelta && onDelta({ type: 'text', text: t }); } }
-      else if (f.e === 'reasoning-delta') { if (t) { reasoning += t; onDelta && onDelta({ type: 'reasoning', text: t }); } }
-      else if (f.e === 'tool-input-available') { tools.push({ name: f.n, input: f.i }); onDelta && onDelta({ type: 'tool', name: f.n, input: f.i }); }
-      else if (f.e === 'finish') { done = true; }
-      else if (f.e === 'error') { const err = new Error('agent: ' + JSON.stringify(f).slice(0, 300)); err.fatal = true; throw err; }
-      return;
+  // 帧格式的解析全部在 lib/parse.js，这里只管累积和分发
+  const applyFrame = f => {
+    const r = parseFrame(f);
+    for (const ev of r.events) {
+      if (ev.type === 'text') { text += ev.text; onDelta && onDelta({ type: 'text', text: ev.text }); }
+      else if (ev.type === 'reasoning') { reasoning += ev.text; onDelta && onDelta({ type: 'reasoning', text: ev.text }); }
+      else if (ev.type === 'tool') { tools.push({ name: ev.name, input: ev.input }); onDelta && onDelta({ type: 'tool', name: ev.name, input: ev.input }); }
     }
-    const line = f.l || '';
-    if (!line) return;
-    if (line.startsWith('a0:')) {
-      let d = ''; try { d = JSON.parse(line.slice(3)); } catch (e) { d = line.slice(3).replace(/^"|"$/g, ''); }
-      if (d) { text += d; onDelta && onDelta({ type: 'text', text: d }); }
-      return;
-    }
-    if (line.startsWith('ag:')) {
-      let d = ''; try { d = JSON.parse(line.slice(3)); } catch (e) { d = line.slice(3); }
-      if (d) { reasoning += d; onDelta && onDelta({ type: 'reasoning', text: d }); }
-      return;
-    }
-    if (line.startsWith('a2:')) {
-      try { const a = JSON.parse(line.slice(3)); if (Array.isArray(a) && a[0] && a[0].type === 'routed_model') routed.push(a[0].organization); } catch (e) {}
-      return;
-    }
-    if (line.startsWith('a3:')) {
-      let m = line.slice(3); try { m = JSON.parse(m); } catch (e) {}
-      const err = new Error('upstream: ' + String(m).slice(0, 300)); err.fatal = true; throw err;
-    }
-    if (line.startsWith('ad:')) { done = true; return; }
-    if (line.startsWith('data: ')) {
-      let o; try { o = JSON.parse(line.slice(6)); } catch (e) { return; }
-      if (!o || !Array.isArray(o.records)) return;
-      for (const rec of o.records) {
-        let b; try { b = JSON.parse(rec.body); } catch (e) { continue; }
-        const d = (b && b.data) || {};
-        if (d.type === 'text-delta') { const t = d.delta || ''; if (t) { text += t; onDelta && onDelta({ type: 'text', text: t }); } }
-        else if (d.type === 'reasoning-delta') { const t = d.delta || ''; if (t) { reasoning += t; onDelta && onDelta({ type: 'reasoning', text: t }); } }
-        else if (d.type === 'tool-input-available') { tools.push({ name: d.toolName, input: d.input }); onDelta && onDelta({ type: 'tool', name: d.toolName, input: d.input }); }
-        else if (d.type === 'finish') { done = true; }
-        else if (d.type === 'error') { const err = new Error('Arena rejected the turn, please resend: ' + JSON.stringify(d).slice(0, 200)); err.fatal = true; throw err; }
-      }
-    }
+    if (r.routed) routed = r.routed;
+    if (r.done) done = true;
+    if (r.error) { const err = new Error(r.error); err.fatal = true; throw err; }
+    return r;
   };
 
   let sendRetries = 0, lastSendAt = Date.now();
   while (Date.now() - t0 < ASK_MAX_MS) {
     await sleep(POLL_MS);
     if (c.closed) throw new Error('tab closed');
+    // 客户端已经断开（Ctrl-C）：任务没必要继续跑，占着全局队列
+    if (aborted()) { throw Object.assign(new Error('aborted by client'), { aborted: true }); }
     const now = (await listStreams(c)) || [];
     const cand = now.filter(x => /create-evaluation|create-chat|realtime|ai-proxy/.test(x.u) && (x.t >= sendTs - 1500 || pre.has(x.id)));
     if (++tick % 30 === 0) log('poll', JSON.stringify({ cur: [...cursors], len: text.length, streams: now.length, done }));
@@ -557,8 +552,7 @@ async function askOnce(s, prompt, onDelta) {
       if (r.f && r.f.length) {
         cursors.set(st.id, r.n); lastFrameAt = Date.now();
         for (const f of r.f) {
-          if (f.e === 'text-delta' || f.e === 'reasoning-delta' || f.e === 'tool-input-available' || (f.l && /^a[0-9]:/.test(f.l))) st.hasOut = true;
-          parseLine(f);
+          if (applyFrame(f).out) st.hasOut = true;
         }
       }
       if (r.done && st.hasOut) anyDone = true;
@@ -573,15 +567,18 @@ async function askOnce(s, prompt, onDelta) {
     if (Date.now() - lastFrameAt > ASK_IDLE_MS) throw new Error('stalled: no frame for ' + Math.round(ASK_IDLE_MS / 1000) + 's');
   }
   if (!text.trim()) throw new Error('empty answer from upstream');
-  return { text, reasoning, routed: routed[routed.length - 1] || '', done, tools };
+  return { text, reasoning, routed, done, tools };
 }
 
 /* ---------- queue ---------- */
 const queue = [];
 let working = false;
+// 队列长度不含正在跑的那一个：文档里的「上限 4」指的是排队数
+const queueDepth = () => queue.length;
+const busyFull = () => queue.length >= MAX_QUEUE;
 function enqueue(fn) {
   return new Promise((res, rej) => {
-    if (queue.length >= MAX_QUEUE) return rej(new Error('busy: queue full'));
+    if (queue.length >= MAX_QUEUE) return rej(Object.assign(new Error('busy: queue full'), { busy: true }));
     queue.push({ fn, res, rej });
     pump();
   });
@@ -608,12 +605,12 @@ function readBody(req) {
 
 // 长任务（Agent 跑工具时可能几分钟没有文本）必须有心跳，否则客户端按空闲超时断开
 function startSSE(res) {
-  res.writeHead(200, {
+  res.writeHead(200, Object.assign({
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
-  });
+  }, CORS_HEADERS));
   res.write(': open\n\n');
   const ping = setInterval(() => {
     try { if (!res.writableEnded && !res.destroyed) res.write(': ping\n\n'); } catch (e) {}
@@ -622,21 +619,50 @@ function startSSE(res) {
   return () => { clearInterval(ping); try { res.end(); } catch (e) {} };
 }
 
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Arena-Drop-System',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+};
+
+// 隧道把 17892 曝到手机上之后，同机任意进程都能用这个桥；ARB_TOKEN 非空时要求 Bearer
+function authorized(req) {
+  if (!AUTH_TOKEN) return true;
+  const h = String(req.headers.authorization || '');
+  return h === 'Bearer ' + AUTH_TOKEN;
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
-  const send = (code, obj) => { const s = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(s) }); res.end(s); };
+  const send = (code, obj) => {
+    const s = JSON.stringify(obj);
+    try {
+      res.writeHead(code, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(s) }, CORS_HEADERS));
+      res.end(s);
+    } catch (e) { /* 客户端已断开 */ }
+  };
+
+  if (req.method === 'OPTIONS') {
+    try { res.writeHead(204, CORS_HEADERS); res.end(); } catch (e) {}
+    return;
+  }
+  if (!authorized(req) && u.pathname !== '/health') {
+    log('401 ' + req.method + ' ' + u.pathname);
+    return send(401, { error: { message: 'unauthorized: set Authorization: Bearer $ARB_TOKEN', type: 'auth_error' } });
+  }
 
   if (u.pathname === '/health') {
     const ok = await cdpApi('GET', '/json/version').then(() => true).catch(() => false);
     if (!ok) ensureChrome().catch(() => {});
     return send(200, {
       ok, chrome: ok, version: VERSION, uptime: Math.round(process.uptime()),
-      sessions: [...sessions.keys()], queue: queue.length, working,
-      limits: { maxQueue: MAX_QUEUE, maxSessions: MAX_SESSIONS, minGapMs: MIN_GAP_MS },
+      sessions: [...sessions.keys()], queue: queueDepth(), working,
+      limits: { maxQueue: MAX_QUEUE, maxSessions: MAX_SESSIONS, minGapMs: MIN_GAP_MS, maxPromptChars: MAX_PROMPT_CHARS },
+      auth: !!AUTH_TOKEN,
     });
   }
   if (u.pathname === '/debug') {
-    const name = u.searchParams.get('session') || 'default';
+    const name = u.searchParams.get('session') || DEFAULT_SESSION;
     const s = sessions.get(name);
     if (!s) return send(404, { error: 'no session', sessions: [...sessions.keys()] });
     try {
@@ -700,7 +726,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (!chipPos1) throw new Error('\u70b9\u4e86 GitHub \u4f46\u4ed3\u5e93\u82af\u7247\u6ca1\u51fa\u6765');
         if (want && (await s.cdp.ev(CHIP_TEXT_JS)) === want) {
-          return { ok: true, repo: want, repos: list.items };
+          return { ok: true, repo: want, repos: list.items, changed: false };
         }
         log('clicked repo chip after attach');
         await realClick(s.cdp, JSON.parse(chipPos1));
@@ -718,7 +744,7 @@ const server = http.createServer(async (req, res) => {
         return { repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
       }
       const curChip = await s.cdp.ev(CHIP_TEXT_JS);
-      if (curChip && curChip === want) return { ok: true, repo: curChip, repos: list.items };
+      if (curChip && curChip === want) return { ok: true, repo: curChip, repos: list.items, changed: false };
       let pos = '';
       for (let i = 0; i < 10; i++) {
         pos = await s.cdp.ev(repoPosJs(want));
@@ -735,10 +761,17 @@ const server = http.createServer(async (req, res) => {
       }
       let chip = '';
       for (let k = 0; k < 8; k++) { chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip === want) break; await sleep(700); }
-      return { ok: true, repo: chip || want, repos: list.items };
+      return { ok: true, repo: chip || want, repos: list.items, changed: true };
     };
-        return doRepo().then(r => {
-      minimizeChrome(); repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { fs.writeFileSync(path.join(STATE_DIR, 'repos.json'), JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => { minimizeChrome(); send(500, { error: e.message }); });
+    // 走同一个队列：否则切仓库会在一轮回答跑到一半时去点页面，把正在生成的状态搅乱
+    return enqueue(doRepo).then(r => {
+      minimizeChrome();
+      // 真的切了仓库才等于开新对话：页面上没有旧上下文了，服务端历史也要跟着清
+      if (r.changed) { histories.delete(rn); contextLost.delete(rn); }
+      repoCache = { repo: r.repo || '', repos: r.repos || [] };
+      try { fs.writeFileSync(path.join(STATE_DIR, 'repos.json'), JSON.stringify(repoCache)); } catch (e) {}
+      send(200, r);
+    }).catch(e => { minimizeChrome(); send(e && e.busy ? 429 : 500, { error: e.message }); });
   }
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;
@@ -762,6 +795,8 @@ const server = http.createServer(async (req, res) => {
       const objectId = obj && obj.result && obj.result.objectId;
       if (!objectId) throw new Error('no file input on page');
       await s.cdp.send('DOM.setFileInputFiles', { files, objectId });
+      // 用完就放，别让文件节点在页面里挂一整轮
+      await s.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'arena-upload' }).catch(() => {});
       await sleep(1500);
       let seen = [];
       for (let i = 0; i < 20; i++) {
@@ -773,11 +808,12 @@ const server = http.createServer(async (req, res) => {
       if (seen.length !== names.length) throw new Error('upload not confirmed: ' + names.filter(n => seen.indexOf(n) < 0).join(', '));
       return { ok: true, attached: seen, files: names };
     };
-    return doUp().then(r => send(200, r)).catch(e => send(500, { error: e.message }));
+    // 同样走队列：上传要往输入框里塞文件，和正在生成的回答抢页面必然打架
+    return enqueue(doUp).then(r => send(200, r)).catch(e => send(e && e.busy ? 429 : 500, { error: e.message }));
   }
   if (u.pathname === '/new') {
-    const name = u.searchParams.get('session') || 'default';
-    histories.delete(name);
+    const name = u.searchParams.get('session') || DEFAULT_SESSION;
+    histories.delete(name); contextLost.delete(name);
     const s = sessions.get(name);
     if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(name); }
     return send(200, { ok: true });
@@ -796,7 +832,11 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     const bodyPrior = prior.length > 1 ? prior.slice(0, -1) : null;
     const srvPrior = histories.get(name) || [];
     const fresh = body.arena_new === true || body.arena_continue === false;
-    const useHist = fresh ? (bodyPrior && bodyPrior.length ? bodyPrior : (srvPrior.length ? srvPrior : null)) : null;
+    // 标签页重建过（LRU 淘汰 / 出错重置）时页面自己没上下文，得把服务端历史补回去，
+    // 否则用户在对话中途会遇到「它怎么忘了刚才说的」这种无声失忆
+    const needReplay = fresh || contextLost.has(name);
+    const useHist = needReplay ? (bodyPrior && bodyPrior.length ? bodyPrior : (srvPrior.length ? srvPrior : null)) : null;
+    if (needReplay && !useHist) log('replay skipped, no history for ' + name);
     let prompt = last;
     if (useHist) {
       const hist = useHist.map(m => (m.role === 'assistant' ? '助手' : '用户') + '：' + ctext(m.content)).join('\n\n');
@@ -806,7 +846,13 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     // Arena 自带系统提示词，客户端的一律不转发
     const CTX_RE = /-{3}[^\n]*Context from:[\s\S]*?End of Context from:[^\n]*\n?-{0,3}/g;
     if (CTX_RE.test(prompt)) { prompt = prompt.replace(CTX_RE, ''); log('ctx stripped -> ' + prompt.length); }
-    prompt = prompt.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').replace(/<\/?[a-z-]+-[a-z-]+>/g, '').replace(/\n{3,}/g, '\n\n').trim();
+    // 只剥客户端确实会注入的那几个标签。以前这里用 /<\/?[a-z-]+-[a-z-]+>/ 一把梭，
+    // 用户问「<my-component> 为什么会这样」时标签会连同标签名一起被吃掉
+    prompt = prompt
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+      .replace(/<(environment_details|environment_context|user_info|available_tools|repo_context)>[\s\S]*?<\/\1>/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
     if (!prompt.trim()) return send(400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
     // 默认只记长度；正文属于隐私，排障时用 ARB_DEBUG_PROMPT=1 显式打开
     if (DEBUG_PROMPT) {
@@ -820,50 +866,70 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
     const created = Math.floor(Date.now() / 1000);
-    const chunk = (delta) => { try { res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta, finish_reason: null }] }) + '\n\n'); } catch (e) {} };
+    const out = (str) => { if (res.writableEnded || res.destroyed) return false; try { return res.write(str); } catch (e) { return false; } };
+    const chunk = (delta) => out('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta, finish_reason: null }] }) + '\n\n');
+
+    // 客户端断开（Ctrl-C）就别让任务继续跑满 10 分钟占着队列
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableFinished) clientGone = true; });
+    const ctx = { aborted: () => clientGone };
+    let live = null;   // 本轮真正用的 session，出错时要靠它停生成/重置
 
     const run = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');
       const s = await getSession(name, opts);
-      const gap = Date.now() - (s.lastAsk || 0);
-      if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
-      s.lastAsk = Date.now();
-      const r = await askOnce(s, prompt, wantStream ? (d => {
-        if (d.type === 'reasoning') { chunk({ reasoning_content: d.text }); return; }
-        if (d.type === 'tool') { chunk({ reasoning_content: '\n\u00b7 ' + d.name + ' ' + JSON.stringify(d.input || {}).slice(0, 300) + '\n' }); return; }
-        if (d.type !== 'text') return;
-        try {
-          res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: { content: d.text }, finish_reason: null }] }) + '\n\n');
-        } catch (e) {}
-      }) : null);
-      s.lastAsk = Date.now();
-      if (r && r.text) {
-        const h = histories.get(name) || [];
-        h.push({ role: 'user', content: last });
-        h.push({ role: 'assistant', content: r.text });
-        if (h.length > 24) h.splice(0, h.length - 24);
-        histories.set(name, h);
+      live = s;
+      s.busy = true;   // 淘汰与退出都看这个字段，别把正在跑的会话连根拔掉
+      try {
+        const gap = Date.now() - (s.lastAsk || 0);
+        if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
+        s.lastAsk = Date.now();
+        const r = await askOnce(s, prompt, wantStream ? (d => {
+          if (d.type === 'reasoning') { chunk({ reasoning_content: d.text }); return; }
+          if (d.type === 'tool') { chunk({ reasoning_content: '\n\u00b7 ' + d.name + ' ' + JSON.stringify(d.input || {}).slice(0, 300) + '\n' }); return; }
+          if (d.type !== 'text') return;
+          chunk({ content: d.text });
+        }) : null, ctx);
+        s.lastAsk = Date.now();
+        if (r && r.text) {
+          const h = histories.get(name) || [];
+          h.push({ role: 'user', content: last });
+          h.push({ role: 'assistant', content: r.text });
+          if (h.length > 24) h.splice(0, h.length - 24);
+          setHistory(name, h);
+          contextLost.delete(name);
+        }
+        return r;
+      } finally {
+        s.busy = false;
       }
-      return r;
     };
 
     if (wantStream) {
       // 队列满要在发响应头之前判掉，否则客户端会收到 200 + 错误事件
-      if (queue.length >= MAX_QUEUE) return send(429, { error: { message: 'busy: queue full', type: 'rate_limit_error' } });
+      if (busyFull()) return send(429, { error: { message: 'busy: queue full', type: 'rate_limit_error' } });
       const endSSE = startSSE(res);
       try {
         const r = await enqueue(run);
         if (truncated) chunk({ reasoning_content: '\n\u00b7 prompt 超长，已截断到 ' + MAX_PROMPT_CHARS + ' 字符\n' });
         if (r && r.routed) chunk({ reasoning_content: '\n\u00b7 routed -> ' + r.routed + '\n' });
-        res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
-        res.write('data: [DONE]\n\n');
+        out('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+        out('data: [DONE]\n\n');
       } catch (e) {
+        // 以前这里引用了不存在的 s（run 内的局部变量），一进 catch 就 ReferenceError，
+        // 结果是 SSE 永远不结束：客户端只能看到 endless ping，等不到任何回答或错误
         log('v1 error:', e.message);
-        if (s) { try { await stopGeneration(s); } catch (e9) {} }
-        if (/composer still holds|send failed|page not ready|ws closed|tab closed|no composer/.test(e.message)) { try { await resetSession(name); } catch (e9) {} }
-        try { res.write('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n'); } catch (e8) {}
+        if (e.aborted || clientGone) {
+          log('client gone, stopping generation');
+        } else {
+          if (live) { try { await stopGeneration(live); } catch (e9) {} }
+          if (sessionBroken(e.message)) { try { await resetSession(name, e.message); } catch (e9) {} }
+          out('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n');
+          out('data: [DONE]\n\n');
+        }
+      } finally {
+        endSSE();
       }
-      endSSE();
       return;
     }
 
@@ -877,7 +943,12 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       });
     } catch (e) {
       log('v1 error:', e.message);
-      try { await resetSession(name); } catch (e9) {}
+      // 别再无差别杀会话了：「队列满」根本不是会话的问题，
+      // 以前这条路径会把正在跑的那一轮连标签页一起关掉
+      if (e.busy) return send(429, { error: { message: e.message, type: 'rate_limit_error' } });
+      if (e.aborted || clientGone) return send(499, { error: { message: 'client closed request', type: 'aborted' } });
+      if (live) { try { await stopGeneration(live); } catch (e9) {} }
+      if (sessionBroken(e.message)) { try { await resetSession(name, e.message); } catch (e9) {} }
       return send(500, { error: { message: e.message, type: 'upstream_error' } });
     }
   }
@@ -889,33 +960,53 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: 'bad json' }); }
     const prompt = String(body.prompt || '').trim();
     if (!prompt) return send(400, { error: 'empty prompt' });
-    const name = body.session || 'default';
+    const name = body.session || DEFAULT_SESSION;
     const stream = !!body.stream;
     const truncated = prompt.length > MAX_PROMPT_CHARS;
     const opts = { model: body.model || '', mode: body.mode || 'agent', fresh: !!body.new };
 
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableFinished) clientGone = true; });
+    const ctx = { aborted: () => clientGone };
+    const out = (str) => { if (res.writableEnded || res.destroyed) return; try { res.write(str); } catch (e) {} };
+    let live = null;
+
     const run = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');
       const s = await getSession(name, opts);
-      const gap = Date.now() - (s.lastAsk || 0);
-      if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
-      s.lastAsk = Date.now();
-      let deltas = [];
-      const r = await askOnce(s, prompt, d => { deltas.push(d); if (stream) { try { res.write('data: ' + JSON.stringify(d) + '\n\n'); } catch (e) {} } });
-      s.lastAsk = Date.now();
-      return r;
+      live = s;
+      s.busy = true;
+      try {
+        const gap = Date.now() - (s.lastAsk || 0);
+        if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
+        s.lastAsk = Date.now();
+        const r = await askOnce(s, prompt, d => { if (stream) out('data: ' + JSON.stringify(d) + '\n\n'); }, ctx);
+        s.lastAsk = Date.now();
+        return r;
+      } finally {
+        s.busy = false;
+      }
+    };
+
+    const fail = async (e) => {
+      log('ask error:', e.message);
+      if (e.aborted || clientGone) return;
+      if (live) { try { await stopGeneration(live); } catch (e9) {} }
+      if (sessionBroken(e.message)) { try { await resetSession(name, e.message); } catch (e9) {} }
     };
 
     if (stream) {
-      if (queue.length >= MAX_QUEUE) return send(429, { ok: false, error: 'busy: queue full' });
+      if (busyFull()) return send(429, { ok: false, error: 'busy: queue full' });
       const endSSE = startSSE(res);
       try {
         const r = await enqueue(run);
-        res.write('data: ' + JSON.stringify({ type: 'done', text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated }) + '\n\n');
+        out('data: ' + JSON.stringify({ type: 'done', text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated }) + '\n\n');
       } catch (e) {
-        try { res.write('data: ' + JSON.stringify({ type: 'error', error: e.message }) + '\n\n'); } catch (e8) {}
+        await fail(e);
+        if (!(e.aborted || clientGone)) out('data: ' + JSON.stringify({ type: 'error', error: e.message }) + '\n\n');
+      } finally {
+        endSSE();
       }
-      endSSE();
       return;
     }
 
@@ -923,14 +1014,25 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       const r = await enqueue(run);
       return send(200, { ok: true, text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated });
     } catch (e) {
-      log('ask error:', e.message);
-      const code = /NEED_VERIFY/.test(e.message) ? 409 : /busy/.test(e.message) ? 429 : 500;
+      await fail(e);
+      if (e.aborted || clientGone) return send(499, { ok: false, error: 'client closed request' });
+      const code = /NEED_VERIFY/.test(e.message) ? 409 : (e.busy || /busy/.test(e.message)) ? 429 : 500;
       return send(code, { ok: false, error: e.message });
     }
   }
   send(404, { error: 'not found' });
 });
 
+server.on('error', e => {
+  // 以前 listen 失败只会被 uncaughtException 记一行日志，进程还活着但没在监听，
+  // 表现为「服务在跑，请求全都不通」
+  if (e && e.code === 'EADDRINUSE') {
+    log('port ' + PORT + ' already in use, another bridge is running? exiting');
+    process.exit(1);
+  }
+  log('server error', (e && e.stack) || e);
+  process.exit(1);
+});
 server.listen(PORT, HOST, () => log('listening http://' + HOST + ':' + PORT + ' v' + VERSION));
 process.on('uncaughtException', e => log('uncaught', (e && e.stack) || e));
 process.on('unhandledRejection', e => log('unhandled', (e && e.stack) || e));
@@ -942,6 +1044,7 @@ async function shutdown(sig) {
   shuttingDown = true;
   log('shutting down (' + sig + '), closing ' + sessions.size + ' session(s)');
   try { server.close(); } catch (e) {}
+  try { for (const [, s] of sessions) { if (s.busy) await stopGeneration(s.cdp); } } catch (e) {}
   for (const [, s] of sessions) {
     try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {}
     try { s.cdp.close(); } catch (e) {}
@@ -958,8 +1061,12 @@ async function waitConversation(c, maxMs) {
   while (Date.now() - t0 < lim) {
     const u = String((await c.ev('location.href')) || '');
     if (/\/agent\/[0-9a-f-]{8,}/i.test(u)) return true;
+    // 裸 /agent 或 /text/direct 表示这个标签页还没开过对话，本来就没有 id 可等；
+    // 以前每条「新会话的第一问」都会在这里空转满 25 秒
+    if (/^https:\/\/arena\.ai\/(agent|text\/direct)\/?(?:[?#].*)?$/i.test(u)) return false;
     await sleep(500);
   }
+  log('waitConversation gave up on ' + String(await c.ev('location.href').catch(() => '')));
   return false;
 }
 

@@ -20,6 +20,7 @@ usage() {
   -s, --session 名字    会话名（默认 main，用于服务端区分并发）
   -m, --model 名字      指定模型
   -r, --reasoning      同时显示思考过程
+  -n, --new            发问前清空该会话在服务端的上下文
   -h, --help           显示本帮助
 
 说明: 每次调用都是独立任务，不继承上一轮的上下文。
@@ -32,13 +33,17 @@ usage() {
 EOF
 }
 
+need_val() {
+  if [ $# -lt 2 ]; then echo "缺少参数：$1" >&2; exit 2; fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--direct)  MODE=direct; shift ;;
     -a|--agent)   MODE=agent; shift ;;
     -n|--new)     FRESH=1; shift ;;
-    -s|--session) SESSION="${2:-main}"; shift 2 ;;
-    -m|--model)   MODEL="${2:-}"; shift 2 ;;
+    -s|--session) need_val "$@"; SESSION="$2"; shift 2 ;;
+    -m|--model)   need_val "$@"; MODEL="$2"; shift 2 ;;
     -r|--reasoning) SHOW_REASON=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     --) shift; break ;;

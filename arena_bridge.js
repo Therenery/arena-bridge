@@ -5,8 +5,11 @@
  * passively tap the page's own fetch stream. No cookies stored, no tokens minted.
  */
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { exec } = require('child_process');
 
+const VERSION = '0.3.0';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -16,12 +19,37 @@ const ASK_TIMEOUT_MS = 600000;
 const POLL_MS = 400;
 const MAX_QUEUE = 4;
 
+/* ---------- 可配置项（全部有默认值，不设也能跑） ---------- */
+// 状态目录：仓库缓存、调试转储都落在这里
+const STATE_DIR = process.env.ARB_STATE_DIR || 'F:/__AI__/work';
+// 常驻标签页上限，超过就按最久未用淘汰，避免标签堆积
+const MAX_SESSIONS = Math.max(1, Number(process.env.ARB_MAX_SESSIONS) || 6);
+// 默认不打印 prompt 正文，也不落盘；排障时再开
+const DEBUG_PROMPT = /^(1|true|yes)$/i.test(process.env.ARB_DEBUG_PROMPT || '');
+// /upload 允许的目录白名单（path.delimiter 分隔）；留空表示不限制
+const UPLOAD_ROOTS = (process.env.ARB_UPLOAD_ROOTS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean);
+// SSE 心跳间隔，防止客户端在长时间工具调用时判定连接空闲
+const SSE_PING_MS = Math.max(1000, Number(process.env.ARB_SSE_PING_MS) || 15000);
+// 单次输入框能装的字符上限，超出会被截断（页面里逐字符敲，越长越慢）
+const MAX_PROMPT_CHARS = Math.max(500, Number(process.env.ARB_MAX_PROMPT_CHARS) || 6000);
+
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// 路径是否落在任一白名单目录内（解析软链后再比，避免 ../ 绕过）
+function within(p, roots) {
+  let rp;
+  try { rp = fs.realpathSync(p); } catch (e) { return false; }
+  return roots.some(root => {
+    let rr;
+    try { rr = fs.realpathSync(root); } catch (e) { return false; }
+    return rp === rr || rp.startsWith(rr.endsWith(path.sep) ? rr : rr + path.sep);
+  });
+}
+
 /* ---------- repo picker ---------- */
 let repoCache = { repo: "", repos: [] };
-try { repoCache = JSON.parse(require("fs").readFileSync("F:/__AI__/work/repos.json", "utf8")); } catch (e) {}
+try { repoCache = JSON.parse(require("fs").readFileSync(path.join(STATE_DIR, 'repos.json'), "utf8")); } catch (e) {}
 async function realClick(c, p) {
   await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: 'none', buttons: 0 });
   await sleep(70);
@@ -209,12 +237,10 @@ async function waitReady(c) {
     if (await c.ev(REVIEW_JS)) {
       log('review state, clicking resume');
       const ok = await c.ev(RESUME_JS);
+      if (!ok) await c.ev("document.body.click()").catch(() => {});
       await sleep(1500);
       try { await c.send('Page.reload', {}); } catch (e) {}
       await sleep(3500);
-      continue;
-      await sleep(2500);
-      if (!ok) { await c.ev("document.body.click()"); await sleep(800); }
       continue;
     }
     await sleep(700);
@@ -257,7 +283,6 @@ async function waitIdle(c, quietMs, maxMs) {
   return false;
 }
 
-const SEND_JS = "(function(){var e=" + EDITOR_SEL + ";if(!e)return '';var bs=[].slice.call(document.querySelectorAll('button'));var f=bs.filter(function(b){return /send/i.test(b.getAttribute('aria-label')||'')});if(!f.length){var r=e.getBoundingClientRect();f=bs.filter(function(b){var q=b.getBoundingClientRect();return q.width>2&&q.height>2&&q.left>r.left+r.width*0.55&&q.top>r.top-20&&q.top<r.bottom+100})}if(!f.length)return '';var b=f[0];var q=b.getBoundingClientRect();if(q.width<2)return '';return JSON.stringify({x:Math.round(q.left+q.width/2),y:Math.round(q.top+q.height/2),dis:!!(b.disabled||b.getAttribute('aria-disabled')==='true')})})()";
 
 async function clickSend(c) {
   const ST = "(function(){var bs=[].slice.call(document.querySelectorAll('button'));var s=bs.filter(function(b){return /send/i.test(b.getAttribute('aria-label')||'')})[0];if(!s)return '';var q=s.getBoundingClientRect();var pe=getComputedStyle(s).pointerEvents;return JSON.stringify({x:Math.round(q.left+q.width/2),y:Math.round(q.top+q.height/2),pe:pe})})()";
@@ -293,7 +318,11 @@ async function typePrompt(c, text) {
   await sleep(80);
   await keyCombo(c, 0, 'Backspace', 'Backspace', 8);
   await sleep(250);
-  const body = text.slice(0, 6000);
+  // 超过上限不能装作没发生：先告警，调用方在响应里能看到 truncated 标记
+  if (text.length > MAX_PROMPT_CHARS) {
+    log('WARN prompt truncated ' + text.length + ' -> ' + MAX_PROMPT_CHARS + ' chars');
+  }
+  const body = text.slice(0, MAX_PROMPT_CHARS);
   for (let i = 0; i < body.length; i++) {
     await c.send('Input.dispatchKeyEvent', { type: 'char', text: body.charAt(i) });
     if (i % 25 === 24) await sleep(20);
@@ -329,6 +358,22 @@ async function resetSession(name) {
   log('session reset ' + name);
 }
 
+// 标签页堆积是长期使用的主要痛点：超过上限就淘汰最久未用的一条
+async function evictSessions(keepKey) {
+  if (sessions.size < MAX_SESSIONS) return;
+  const victims = [...sessions.entries()]
+    .filter(([k]) => k !== keepKey)
+    .sort((a, b) => (a[1].lastAsk || 0) - (b[1].lastAsk || 0));
+  while (sessions.size >= MAX_SESSIONS && victims.length) {
+    const [k, s] = victims.shift();
+    log('evict session ' + k + ' (limit ' + MAX_SESSIONS + ')');
+    try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {}
+    try { s.cdp.close(); } catch (e) {}
+    sessions.delete(k);
+    histories.delete(k);
+  }
+}
+
 async function getSession(name, opts) {
   const key = name || 'default';
   let s = sessions.get(key);
@@ -339,6 +384,7 @@ async function getSession(name, opts) {
     sessions.delete(key); s = null;
   }
   if (!(await ensureChrome())) throw new Error('chrome unavailable');
+  await evictSessions(key);
   let r = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     try { r = await openTab(opts.model, opts.mode); break; }
@@ -493,6 +539,22 @@ function readBody(req) {
   });
 }
 
+// 长任务（Agent 跑工具时可能几分钟没有文本）必须有心跳，否则客户端按空闲超时断开
+function startSSE(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(': open\n\n');
+  const ping = setInterval(() => {
+    try { if (!res.writableEnded && !res.destroyed) res.write(': ping\n\n'); } catch (e) {}
+  }, SSE_PING_MS);
+  if (ping.unref) ping.unref();
+  return () => { clearInterval(ping); try { res.end(); } catch (e) {} };
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   const send = (code, obj) => { const s = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(s) }); res.end(s); };
@@ -500,7 +562,11 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname === '/health') {
     const ok = await cdpApi('GET', '/json/version').then(() => true).catch(() => false);
     if (!ok) ensureChrome().catch(() => {});
-    return send(200, { ok, chrome: ok, sessions: [...sessions.keys()], queue: queue.length, working });
+    return send(200, {
+      ok, chrome: ok, version: VERSION, uptime: Math.round(process.uptime()),
+      sessions: [...sessions.keys()], queue: queue.length, working,
+      limits: { maxQueue: MAX_QUEUE, maxSessions: MAX_SESSIONS, minGapMs: MIN_GAP_MS },
+    });
   }
   if (u.pathname === '/debug') {
     const name = u.searchParams.get('session') || 'default';
@@ -604,7 +670,7 @@ const server = http.createServer(async (req, res) => {
       for (let k = 0; k < 8; k++) { chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip === want) break; await sleep(700); }
       return { ok: true, repo: chip || want, repos: list.items };
     };
-    return doRepo().then(r => { repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { require('fs').writeFileSync('F:/__AI__/work/repos.json', JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => send(500, { error: e.message }));
+        return doRepo().then(r => { repoCache = { repo: r.repo || '', repos: r.repos || [] }; try { fs.writeFileSync(path.join(STATE_DIR, 'repos.json'), JSON.stringify(repoCache)); } catch (e) {} send(200, r); }).catch(e => send(500, { error: e.message }));
   }
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;
@@ -612,10 +678,14 @@ const server = http.createServer(async (req, res) => {
     const rn = body.session || 'main';
     const files = (Array.isArray(body.files) ? body.files : [body.file]).filter(Boolean).map(String);
     if (!files.length) return send(400, { error: 'no files' });
-    const fsx = require('fs'), pathx = require('path');
-    const missing = files.filter(f => { try { return !fsx.statSync(f).isFile(); } catch (e) { return true; } });
+    const missing = files.filter(f => { try { return !fs.statSync(f).isFile(); } catch (e) { return true; } });
     if (missing.length) return send(400, { error: 'not found: ' + missing.join(', ') });
-    const names = files.map(f => pathx.basename(f));
+    // 这个接口会把本地文件内容送到 arena.ai，属于外发面，白名单外一律拒绝
+    if (UPLOAD_ROOTS.length) {
+      const denied = files.filter(f => !within(f, UPLOAD_ROOTS));
+      if (denied.length) return send(403, { error: 'outside ARB_UPLOAD_ROOTS: ' + denied.join(', ') });
+    }
+    const names = files.map(f => path.basename(f));
     const doUp = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');
       const s = await getSession(rn, { mode: 'agent' });
@@ -670,8 +740,14 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     if (CTX_RE.test(prompt)) { prompt = prompt.replace(CTX_RE, ''); log('ctx stripped -> ' + prompt.length); }
     prompt = prompt.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').replace(/<\/?[a-z-]+-[a-z-]+>/g, '').replace(/\n{3,}/g, '\n\n').trim();
     if (!prompt.trim()) return send(400, { error: { message: 'empty prompt', type: 'invalid_request_error' } });
-    log('PROMPT len=' + prompt.length + ' head=' + prompt.slice(0, 200).replace(/[\r\n]+/g, ' '));
-    try { require('fs').writeFileSync('F:/__AI__/work/last-prompt.txt', prompt); } catch (e) {}
+    // 默认只记长度；正文属于隐私，排障时用 ARB_DEBUG_PROMPT=1 显式打开
+    if (DEBUG_PROMPT) {
+      log('PROMPT len=' + prompt.length + ' head=' + prompt.slice(0, 200).replace(/[\r\n]+/g, ' '));
+      try { fs.writeFileSync(path.join(STATE_DIR, 'last-prompt.txt'), prompt); } catch (e) {}
+    } else {
+      log('PROMPT len=' + prompt.length);
+    }
+    const truncated = prompt.length > MAX_PROMPT_CHARS;
     const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', fresh };
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
@@ -704,19 +780,21 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     };
 
     if (wantStream) {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-      res.write(': open\n\n');
+      // 队列满要在发响应头之前判掉，否则客户端会收到 200 + 错误事件
+      if (queue.length >= MAX_QUEUE) return send(429, { error: { message: 'busy: queue full', type: 'rate_limit_error' } });
+      const endSSE = startSSE(res);
       try {
         const r = await enqueue(run);
+        if (truncated) chunk({ reasoning_content: '\n\u00b7 prompt 超长，已截断到 ' + MAX_PROMPT_CHARS + ' 字符\n' });
         if (r && r.routed) chunk({ reasoning_content: '\n\u00b7 routed -> ' + r.routed + '\n' });
         res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
         res.write('data: [DONE]\n\n');
       } catch (e) {
         log('v1 error:', e.message);
-      try { await resetSession(name); } catch (e9) {}
-        res.write('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n');
+        try { await resetSession(name); } catch (e9) {}
+        try { res.write('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n'); } catch (e8) {}
       }
-      res.end();
+      endSSE();
       return;
     }
 
@@ -726,7 +804,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         id, object: 'chat.completion', created, model: body.model || 'arena-agent',
         choices: [{ index: 0, message: { role: 'assistant', content: r.text }, finish_reason: 'stop' }],
         usage: { prompt_tokens: prompt.length, completion_tokens: (r.text || '').length, total_tokens: prompt.length + (r.text || '').length },
-        arena: { tools: r.tools, reasoning: r.reasoning, routed: r.routed }
+        arena: { tools: r.tools, reasoning: r.reasoning, routed: r.routed, truncated }
       });
     } catch (e) {
       log('v1 error:', e.message);
@@ -744,6 +822,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     if (!prompt) return send(400, { error: 'empty prompt' });
     const name = body.session || 'default';
     const stream = !!body.stream;
+    const truncated = prompt.length > MAX_PROMPT_CHARS;
     const opts = { model: body.model || '', mode: body.mode || 'agent', fresh: !!body.new };
 
     const run = async () => {
@@ -759,21 +838,21 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     };
 
     if (stream) {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-      res.write(': open\n\n');
+      if (queue.length >= MAX_QUEUE) return send(429, { ok: false, error: 'busy: queue full' });
+      const endSSE = startSSE(res);
       try {
         const r = await enqueue(run);
-        res.write('data: ' + JSON.stringify({ type: 'done', text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools }) + '\n\n');
+        res.write('data: ' + JSON.stringify({ type: 'done', text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated }) + '\n\n');
       } catch (e) {
-        res.write('data: ' + JSON.stringify({ type: 'error', error: e.message }) + '\n\n');
+        try { res.write('data: ' + JSON.stringify({ type: 'error', error: e.message }) + '\n\n'); } catch (e8) {}
       }
-      res.end();
+      endSSE();
       return;
     }
 
     try {
       const r = await enqueue(run);
-      return send(200, { ok: true, text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools });
+      return send(200, { ok: true, text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated });
     } catch (e) {
       log('ask error:', e.message);
       const code = /NEED_VERIFY/.test(e.message) ? 409 : /busy/.test(e.message) ? 429 : 500;
@@ -783,9 +862,26 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
   send(404, { error: 'not found' });
 });
 
-server.listen(PORT, HOST, () => log('listening http://' + HOST + ':' + PORT));
-process.on('uncaughtException', e => log('uncaught', e.message));
-process.on('unhandledRejection', e => log('unhandled', e && e.message));
+server.listen(PORT, HOST, () => log('listening http://' + HOST + ':' + PORT + ' v' + VERSION));
+process.on('uncaughtException', e => log('uncaught', (e && e.stack) || e));
+process.on('unhandledRejection', e => log('unhandled', (e && e.stack) || e));
+
+// 退出时把会话标签一起关掉，别把 Chrome 留一堆孤儿页
+let shuttingDown = false;
+async function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log('shutting down (' + sig + '), closing ' + sessions.size + ' session(s)');
+  try { server.close(); } catch (e) {}
+  for (const [, s] of sessions) {
+    try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {}
+    try { s.cdp.close(); } catch (e) {}
+  }
+  sessions.clear();
+  setTimeout(() => process.exit(0), 300).unref();
+}
+process.on('SIGINT', () => { shutdown('SIGINT'); });
+process.on('SIGTERM', () => { shutdown('SIGTERM'); });
 
 async function waitConversation(c, maxMs) {
   const t0 = Date.now();

@@ -51,6 +51,12 @@ PROMPT="$*"
 if [ -z "$PROMPT" ]; then usage; exit 2; fi
 
 PB64=$(printf '%s' "$PROMPT" | base64 -w0)
+# Windows 命令行上限（cmd 8191 字符）会先撞上，转发前就挡住，别让 base64 被截断成乱码
+if [ "${#PB64}" -gt 7000 ]; then
+  echo "问题太长：base64 后 ${#PB64} 字符，超过 Windows 命令行上限。" >&2
+  echo "  约合中文 1700 字。请拆成多次提问，或把长文放进工作区仓库让 Agent 自己读。" >&2
+  exit 2
+fi
 CMD="powershell -NoProfile -ExecutionPolicy Bypass -File $PS1WIN -PromptB64 $PB64 -Session $SESSION -Mode $MODE -Fresh $FRESH -Out $OUTWIN"
 [ -n "$MODEL" ] && CMD="$CMD -Model $MODEL"
 
@@ -66,6 +72,12 @@ N=0
 while kill -0 "$PID" 2>/dev/null; do
   sleep 5
   N=$((N+5))
+  if [ "$N" -gt 1560 ]; then
+    echo "" >&2
+    echo "等待超时（26 分钟），已放弃；arb.ps1 侧可能还在跑，稍后用 arena new 清理会话。" >&2
+    kill "$PID" 2>/dev/null
+    exit 1
+  fi
   if [ -t 2 ]; then printf '\r\033[2m[%s/%s] 已等 %ds\033[0m' "$MODE" "$SESSION" "$N" >&2; fi
 done
 wait "$PID" 2>/dev/null

@@ -54,14 +54,14 @@ arena new [名字]     # 清空会话（服务端历史 + 本地记录）
 手机 / 任意客户端
    │  ssh（pc 命令，三路自适应）
    ▼
-电脑 127.0.0.1:17892  arena_bridge.js（node，约 480 行）
+电脑 127.0.0.1:17892  arena_bridge.js（node，约 890 行）
    ├─ POST /v1/chat/completions   OpenAI 兼容
    ├─ POST /ask                   简化接口
    ├─ GET  /health  /v1/models  /debug
    │
    ├─ CDP → Chrome 9222（已有，schtasks 任务 chrome-arena 自动拉起）
    │    ├─ Page.addScriptToEvaluateOnNewDocument 注入拦截脚本
-   │    └─ Input.insertText + Enter 模拟真人输入
+   │    └─ 逐字符 dispatchKeyEvent + 真实鼠标点击发送
    │
    └─ 页面自己发请求 → 旁路 clone 读 SSE
         ├─ direct 模式：/nextjs-api/stream/create-evaluation
@@ -132,9 +132,9 @@ aichat -S -m arena:arena-direct "问题"        # 单发、非流式
 | 监听 | 只绑 127.0.0.1，不开公网 |
 | 并发 | 全局队列串行，队列上限 4 |
 | 频率 | 两次请求最小间隔 3 秒 |
-| 输入 | 真键盘事件（`Input.insertText` + `Enter`），页面看到的是人 |
+| 输入 | 逐字符 `dispatchKeyEvent` + 真实鼠标点击发送，页面看到的是人 |
 | 重试 | 失败不自动重试，避免触发风控 |
-| 日志 | 只记 sid / 游标 / 长度，不记 prompt 正文 |
+| 日志 | 默认只记 sid / 游标 / 长度；prompt 正文需 `ARB_DEBUG_PROMPT=1` 才记 |
 
 ---
 
@@ -178,7 +178,7 @@ Get-Content F:\__AI__\tmp\arb.log -Tail 30
 
 | 文件 | 作用 |
 |---|---|
-| `arena_bridge.js` | 主服务，480 行 |
+| `arena_bridge.js` | 主服务，约 890 行 |
 | `arb.ps1` | 手机侧调用入口（发请求 + 写结果） |
 | `rd2.js` | 结果回传（gzip + base64） |
 | `start_bridge.ps1` | 前台启动脚本 |

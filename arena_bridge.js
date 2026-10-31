@@ -76,7 +76,7 @@ async function connectTab(tabId) {
   const ws = new WebSocket(t.webSocketDebuggerUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('ws open failed')); });
   const c = new CDP(ws);
-  await c.send('Runtime.enable');
+  /* Runtime.enable omitted: most detectable CDP side effect */
   await c.send('Page.enable');
   return c;
 }
@@ -154,6 +154,15 @@ const INJECT = String.raw`
     }
     return xsend.apply(this, arguments);
   };
+  try {
+    const hide = (k, v) => Object.defineProperty(window, k, { value: v, enumerable: false, configurable: true, writable: true });
+    hide('__arbInstalled', window.__arbInstalled);
+    hide('__arbSeq', window.__arbSeq);
+    hide('__arbStreams', window.__arbStreams);
+    window.fetch = new Proxy(window.fetch, {});
+    XO.prototype.open = new Proxy(XO.prototype.open, {});
+    XO.prototype.send = new Proxy(XO.prototype.send, {});
+  } catch (e) {}
 })();
 `;
 
@@ -383,6 +392,7 @@ async function askOnce(s, prompt, onDelta) {
     }
   };
 
+  let sendRetries = 0, lastSendAt = Date.now();
   while (Date.now() - t0 < ASK_TIMEOUT_MS) {
     await sleep(POLL_MS);
     if (c.closed) throw new Error('tab closed');
@@ -391,7 +401,17 @@ async function askOnce(s, prompt, onDelta) {
     if (++tick % 30 === 0) log('poll', JSON.stringify({ cur: [...cursors], len: text.length, streams: now.length, done }));
     if (!cand.length) {
       if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
-      if (Date.now() - t0 > 45000) throw new Error('no stream appeared (send may have failed)');
+      if (Date.now() - lastSendAt > 10000 && sendRetries < 2) {
+        const left = await c.ev(VAL_JS);
+        if (left <= 1) {
+          sendRetries++;
+          log('no stream after ' + Math.round((Date.now() - lastSendAt) / 1000) + 's, re-sending #' + sendRetries);
+          try { await typePrompt(c, prompt); } catch (e) { log('re-send failed', e.message); }
+          lastSendAt = Date.now();
+          continue;
+        }
+      }
+      if (Date.now() - lastSendAt > 45000) throw new Error('no stream appeared (send may have failed)');
       continue;
     }
     let anyDone = false;
@@ -504,6 +524,37 @@ const server = http.createServer(async (req, res) => {
     };
     return doRepo().then(r => send(200, r)).catch(e => send(500, { error: e.message }));
   }
+  if (u.pathname === '/upload' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: 'bad json' }); }
+    const rn = body.session || 'main';
+    const files = (Array.isArray(body.files) ? body.files : [body.file]).filter(Boolean).map(String);
+    if (!files.length) return send(400, { error: 'no files' });
+    const fsx = require('fs'), pathx = require('path');
+    const missing = files.filter(f => { try { return !fsx.statSync(f).isFile(); } catch (e) { return true; } });
+    if (missing.length) return send(400, { error: 'not found: ' + missing.join(', ') });
+    const names = files.map(f => pathx.basename(f));
+    const doUp = async () => {
+      if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      const s = await getSession(rn, { mode: 'agent' });
+      await waitReady(s.cdp);
+      const obj = await s.cdp.send('Runtime.evaluate', { expression: "document.querySelector('input[type=file]')", objectGroup: 'arena-upload' });
+      const objectId = obj && obj.result && obj.result.objectId;
+      if (!objectId) throw new Error('no file input on page');
+      await s.cdp.send('DOM.setFileInputFiles', { files, objectId });
+      await sleep(1500);
+      let seen = [];
+      for (let i = 0; i < 20; i++) {
+        const txt = await s.cdp.ev('(document.body&&document.body.innerText)||""');
+        seen = names.filter(n => String(txt).indexOf(n) >= 0);
+        if (seen.length === names.length) break;
+        await sleep(700);
+      }
+      if (seen.length !== names.length) throw new Error('upload not confirmed: ' + names.filter(n => seen.indexOf(n) < 0).join(', '));
+      return { ok: true, attached: seen, files: names };
+    };
+    return doUp().then(r => send(200, r)).catch(e => send(500, { error: e.message }));
+  }
   if (u.pathname === '/new') {
     const name = u.searchParams.get('session') || 'default';
     histories.delete(name);
@@ -543,6 +594,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
     const created = Math.floor(Date.now() / 1000);
+    const chunk = (delta) => { try { res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta, finish_reason: null }] }) + '\n\n'); } catch (e) {} };
 
     const run = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');
@@ -551,6 +603,8 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
       s.lastAsk = Date.now();
       const r = await askOnce(s, prompt, wantStream ? (d => {
+        if (d.type === 'reasoning') { chunk({ reasoning_content: d.text }); return; }
+        if (d.type === 'tool') { chunk({ reasoning_content: '\n\u00b7 ' + d.name + ' ' + JSON.stringify(d.input || {}).slice(0, 300) + '\n' }); return; }
         if (d.type !== 'text') return;
         try {
           res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: { content: d.text }, finish_reason: null }] }) + '\n\n');
@@ -572,6 +626,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       res.write(': open\n\n');
       try {
         const r = await enqueue(run);
+        if (r && r.routed) chunk({ reasoning_content: '\n\u00b7 routed -> ' + r.routed + '\n' });
         res.write('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
         res.write('data: [DONE]\n\n');
       } catch (e) {

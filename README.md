@@ -121,7 +121,7 @@ Codex 的 TUI 按固定宽度排版，Termux 88 列下会崩；Qwen Code 的 TUI
 
 ### 客户端配置
 
-%USERPROFILE%\.qwen\settings.json：
+%USERPROFILE%\.arena\settings.json：
 
 ~~~json
 {
@@ -144,9 +144,18 @@ Codex 的 TUI 按固定宽度排版，Termux 88 列下会崩；Qwen Code 的 TUI
 cli-windows\arena.cmd 放进 PATH（例如 E:\Programz\bin），敲 arena 即进界面：
 
 - 体检 17892，没起来就拉起 arena_bridge.js
-- QWEN_SYSTEM_MD 指向空文件，客户端不再自带系统提示词
+- ARENA_SYSTEM_MD 指向空文件，客户端不再自带系统提示词
 - 工作目录切到空目录，避免把 AGENTS.md 之类带进对话
 
+### 常用命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/repo` | 列出 Arena 工作区里可切换的仓库 |
+| `/repo owner/name` | 切换到指定仓库（会重建会话） |
+| `/upload <路径>` | 把本地文件挂到 Arena 输入框，路径带空格时用引号 |
+
+思考过程、工具调用、路由模型会以 `·` 开头的行显示在思考区。
 ### 发送机制（踩过的坑）
 
 Arena 的输入框是 tiptap/ProseMirror。只有逐字符的真实键盘事件会更新它的内部状态：

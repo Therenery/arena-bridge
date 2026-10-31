@@ -38,7 +38,7 @@ const DIALOG_OPEN_JS = "(function(){var d=document.querySelector('[role=dialog],
 const OPEN_PICKER_JS = "(function(){var fire=function(el){var r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;var o={bubbles:true,cancelable:true,clientX:x,clientY:y,view:window,button:0,buttons:1,pointerId:1,isPrimary:true,pointerType:'mouse'};el.dispatchEvent(new PointerEvent('pointerdown',o));el.dispatchEvent(new MouseEvent('mousedown',o));el.dispatchEvent(new PointerEvent('pointerup',o));el.dispatchEvent(new MouseEvent('mouseup',o));el.dispatchEvent(new MouseEvent('click',o));};var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];if(b){fire(b);return 'OK'}var g=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return (x.getAttribute('aria-label')||'')==='GitHub'})[0];if(g){fire(g);return 'CLICKED_GITHUB'}return 'NO_CHIP'})()";
 const LIST_REPOS_JS = "(function(){var d=document.querySelector('[role=dialog],[role=menu]');if(!d)return JSON.stringify({open:false,items:[]});var out=[];[].slice.call(d.querySelectorAll('*')).forEach(function(x){if(x.children.length>2)return;var t=(x.innerText||'').trim();if(!/^[\\w.-]+\\/[\\w.-]+$/.test(t))return;if(out.indexOf(t)<0)out.push(t)});return JSON.stringify({open:true,items:out})})()";
 const CHIP_TEXT_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){return /^[\\w.-]+\\/[\\w.-]+$/.test((x.innerText||'').trim())})[0];return b?(b.innerText||'').trim():''})()";
-const repoPosJs = name => "(function(){var d=document.querySelector('[role=dialog]');if(!d)return '';var cs=[];[].slice.call(d.querySelectorAll('*')).forEach(function(e){if((e.innerText||'').trim()!==" + JSON.stringify(name) + ")return;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)return;if(r.top<0||r.bottom>innerHeight)return;cs.push(r)});for(var i=0;i<cs.length;i++){var r=cs[i],x=Math.round(r.left+r.width/2),y=Math.round(r.top+r.height/2);var h=document.elementFromPoint(x,y);for(var k=0;k<5&&h;k++){if((h.innerText||'').trim()===" + JSON.stringify(name) + ")return JSON.stringify({x:x,y:y});h=h.parentElement}}return ''})()";
+const repoPosJs = name => "(function(){var d=document.querySelector('[role=dialog]');if(!d)return '';var nm=" + JSON.stringify(name) + ";var es=[].slice.call(d.querySelectorAll('*')).filter(function(x){return (x.innerText||'').trim()===nm});if(!es.length)return '';var e=es[es.length-1];try{e.scrollIntoView({block:'center',inline:'nearest'})}catch(err){try{e.scrollIntoView()}catch(e2){}}var r=e.getBoundingClientRect();var px=Math.round(r.left+r.width/2),py=Math.round(r.top+r.height/2);if(py<4||py>innerHeight-4)return '';var h=document.elementFromPoint(px,py);for(var k=0;k<5&&h;k++){if((h.innerText||'').trim()===nm)return JSON.stringify({x:px,y:py});h=h.parentElement}return ''})()";
 
 /* ---------- CDP plumbing ---------- */
 function cdpApi(method, path) {
@@ -521,7 +521,7 @@ const server = http.createServer(async (req, res) => {
     if (u.searchParams.get('cached')) return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
     const doRepo = async () => {
       const s = await getSession(rn, { mode: 'agent' });
-      await sleep(800);
+      await sleep(2500);
       let list = { items: [] };
       const readList = async () => {
         const raw = await s.cdp.ev(LIST_REPOS_JS);
@@ -558,15 +558,20 @@ const server = http.createServer(async (req, res) => {
         if (!addPos) throw new Error('\u627e\u4e0d\u5230\u8f93\u5165\u6846\u4e0b\u65b9\u7684 GitHub \u6309\u94ae');
         await realClick(s.cdp, JSON.parse(addPos));
         log('clicked outer GitHub');
-        await sleep(1800);
-        let selPos = '';
-        for (let i = 0; i < 12; i++) {
-          selPos = await s.cdp.ev(SEL_TAB_POS_JS);
-          if (selPos && selPos.charAt(0) === '{') break;
-          await sleep(700);
+        let chipPos1 = '';
+        for (let i = 0; i < 30; i++) {
+          await sleep(1000);
+          chipPos1 = await s.cdp.ev(CHIP_POS_JS);
+          if (chipPos1 && chipPos1.charAt(0) === '{') break;
+          chipPos1 = '';
         }
-        if (selPos && selPos.charAt(0) === '{') { await realClick(s.cdp, JSON.parse(selPos)); await sleep(1500); }
-        await sleep(1200);
+        if (!chipPos1) throw new Error('\u70b9\u4e86 GitHub \u4f46\u4ed3\u5e93\u82af\u7247\u6ca1\u51fa\u6765');
+        if (want && (await s.cdp.ev(CHIP_TEXT_JS)) === want) {
+          return { ok: true, repo: want, repos: list.items };
+        }
+        log('clicked repo chip after attach');
+        await realClick(s.cdp, JSON.parse(chipPos1));
+        await sleep(1800);
         for (let i = 0; i < 12; i++) {
           list = await readList();
           if (list.items && list.items.length) break;
@@ -579,6 +584,8 @@ const server = http.createServer(async (req, res) => {
         await sleep(500);
         return { repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
       }
+      const curChip = await s.cdp.ev(CHIP_TEXT_JS);
+      if (curChip && curChip === want) return { ok: true, repo: curChip, repos: list.items };
       let pos = '';
       for (let i = 0; i < 10; i++) {
         pos = await s.cdp.ev(repoPosJs(want));

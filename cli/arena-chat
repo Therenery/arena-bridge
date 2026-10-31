@@ -8,14 +8,18 @@ NOBANNER=0
 FRESH=0
 REPO=''
 
+need_val() {
+  if [ $# -lt 2 ]; then echo "缺少参数：$1" >&2; exit 2; fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--direct)   MODEL=arena-direct; shift ;;
     -a|--agent)    MODEL=arena-agent;  shift ;;
-    -s|--session)  SESSION="${2:-main}"; shift 2 ;;
-    -m|--model)    MODEL="${2:-arena-agent}"; shift 2 ;;
+    -s|--session)  need_val "$@"; SESSION="$2"; shift 2 ;;
+    -m|--model)    need_val "$@"; MODEL="$2"; shift 2 ;;
     -n|--fresh)    FRESH=1; shift ;;
-    -R|--repo)     REPO="${2:-}"; shift 2 ;;
+    -R|--repo)     need_val "$@"; REPO="$2"; shift 2 ;;
     -q|--quiet)    NOBANNER=1; shift ;;
     -h|--help)
       cat <<'EOF'

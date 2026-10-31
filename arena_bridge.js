@@ -296,6 +296,15 @@ async function readFrames(c, sid, from) {
 const sessions = new Map();
 const histories = new Map();
 
+async function resetSession(name) {
+  const s = sessions.get(name);
+  if (!s) return;
+  try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {}
+  try { s.cdp.close(); } catch (e) {}
+  sessions.delete(name);
+  log('session reset ' + name);
+}
+
 async function getSession(name, opts) {
   const key = name || 'default';
   let s = sessions.get(key);
@@ -567,6 +576,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         res.write('data: [DONE]\n\n');
       } catch (e) {
         log('v1 error:', e.message);
+      try { await resetSession(name); } catch (e9) {}
         res.write('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n');
       }
       res.end();
@@ -583,6 +593,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       });
     } catch (e) {
       log('v1 error:', e.message);
+      try { await resetSession(name); } catch (e9) {}
       return send(500, { error: { message: e.message, type: 'upstream_error' } });
     }
   }

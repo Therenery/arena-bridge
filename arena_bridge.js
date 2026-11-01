@@ -332,12 +332,22 @@ function minimizeChrome() {
   try { exec('schtasks /run /tn arena_minimize', () => {}); } catch (e) {}
 }
 
-async function openTab(model, mode) {
+async function openTab(model, mode, models) {
   const q = [];
   if (model && !/^arena-/.test(model)) q.push('model_a=' + encodeURIComponent(model));
-  const base = mode === 'agent' ? '/agent' : '/text/direct';
+  let base = '/agent';
+  if (mode === 'direct') base = '/text/direct';
+  else if (mode === 'side') {
+    base = '/text/side-by-side';
+    if (models && models[0]) q.push('model_a=' + encodeURIComponent(models[0]));
+    if (models && models[1]) q.push('model_b=' + encodeURIComponent(models[1]));
+  } else if (mode === 'battle') {
+    // 对战没有独立路由：首页的 Mode 下拉里选 Battle
+    base = '/';
+  }
   const url = 'https://arena.ai' + base + (q.length ? '?' + q.join('&') : '');
-  const adopted = await adoptTab(base);
+  // 对战 / 并排每一轮都是独立会话，接管旧页面会把上一轮的问答带进来
+  const adopted = mode === 'battle' || mode === 'side' ? null : await adoptTab(base);
   if (adopted) {
     log('adopted tab', adopted.tabId, String(adopted.url).slice(0, 60));
     minimizeChrome();
@@ -349,6 +359,11 @@ async function openTab(model, mode) {
   await c.send('Page.addScriptToEvaluateOnNewDocument', { source: INJECT });
   await c.send('Page.navigate', { url });
   await waitReady(c);
+  if (mode === 'battle') {
+    // 首页默认就是 battle，但用户上次选过别的模式时要显式切回来
+    await c.ev("(function(){var s=document.querySelector('select');if(!s||s.value==='battle')return;var d=Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value');d.set.call(s,'battle');s.dispatchEvent(new Event('change',{bubbles:true}));})()").catch(() => {});
+    await sleep(1200);
+  }
   log('tab ready', tab.id, url);
   minimizeChrome();
   return { tabId: tab.id, cdp: c, url };
@@ -378,6 +393,13 @@ async function waitIdle(c, quietMs, maxMs) {
 async function clickSend(c) {
   const ST = "(function(){var bs=[].slice.call(document.querySelectorAll('button'));var s=bs.filter(function(b){return /send/i.test(b.getAttribute('aria-label')||'')})[0];if(!s)return '';var q=s.getBoundingClientRect();var pe=getComputedStyle(s).pointerEvents;return JSON.stringify({x:Math.round(q.left+q.width/2),y:Math.round(q.top+q.height/2),pe:pe})})()";
   for (let i = 0; i < 20; i++) {
+    // 合成鼠标事件在后台/最小化窗口里可能被丢弃；DOM click 兜底
+    if (i >= 3) {
+      const dom = await c.ev("(function(){var bs=[].slice.call(document.querySelectorAll('button'));var s=bs.filter(function(b){return /send/i.test(b.getAttribute('aria-label')||'')})[0];if(!s||s.disabled)return '';s.click();return 'ok'})()");
+      if (dom === 'ok') { await sleep(900); if ((await c.ev(VAL_JS)) <= 1) return true; }
+      await sleep(250);
+      continue;
+    }
     const raw = await c.ev(ST);
     if (raw && raw.charAt(0) === '{') {
       const p = JSON.parse(raw);
@@ -389,6 +411,7 @@ async function clickSend(c) {
         await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: 0, clickCount: 1 });
         await sleep(900);
         const left = await c.ev(VAL_JS);
+        log('clickSend try ' + i + ' left=' + left);
         if (left <= 1) return true;
       }
     }
@@ -420,8 +443,16 @@ async function typePrompt(c, text) {
   }
   await sleep(700);
   const n = await c.ev(VAL_JS);
+  log('typed len=' + n + ' url=' + String(await c.ev('location.href')).slice(0, 60));
   if (!n) throw new Error('typing failed (editor empty after insert)');
-  const ok = await clickSend(c);
+  let ok = await clickSend(c);
+  if (!ok) {
+    // 并排对照页的发送键有时不响应合成鼠标事件，回车是同一路径的兜底
+    await c.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await sleep(1200);
+    ok = (await c.ev(VAL_JS)) <= 1;
+  }
   if (!ok) throw new Error('send failed (composer still holds text)');
 }
 
@@ -457,6 +488,8 @@ async function readFrames(c, sid, from) {
 /* ---------- session ---------- */
 const sessions = new Map();
 const histories = new Map();
+// 每个 CLI 会话最近一轮对战的结果，/vote 用它把投票和答案对上
+const battleRounds = new Map();
 // 标签页被关掉/重建后，页面自己的上下文没了；下一条请求要把服务端历史补进 prompt，
 // 否则对话中途遇到一次错误就悄悄失忆，用户只会觉得「它怎么忘了刚才说的」
 const contextLost = new Set();
@@ -508,7 +541,7 @@ async function getSession(name, opts) {
   await evictSessions(key);
   let r = null;
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { r = await openTab(opts.model, opts.mode); break; }
+    try { r = await openTab(opts.model, opts.mode, opts.models); break; }
     catch (e) {
       log('openTab failed #' + attempt + ': ' + e.message);
       if (attempt === 2) throw e;
@@ -607,6 +640,76 @@ async function askOnce(s, prompt, onDelta, ctx) {
   if (!text.trim()) throw new Error('empty answer from upstream');
   dismissReviewSoon(c);
   return { text, reasoning, routed, done, tools };
+}
+
+/* ---------- battle / side-by-side ---------- */
+// 对战页把两个回答并排放在一个 carousel 里，每条是一个子节点：
+// 第一行是「助手 A / 助手 B」（投票后换成真实模型名），下面是正文。
+const BATTLE_PANES_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('div')).filter(function(e){return String(e.className||'').indexOf('@container/carousel')>=0});if(!cs.length)return '';var c=cs[cs.length-1];if(c.childElementCount!==2)return '';function pane(k){var sp=[].slice.call(k.querySelectorAll('span')).map(function(s){return (s.innerText||'').trim()}).filter(Boolean);var t=(k.innerText||'').trim();var lb=sp[0]||'';return {label:lb,text:t.slice(lb.length).trim()}}return JSON.stringify({a:pane(c.children[0]),b:pane(c.children[1])})})()";
+const VOTE_READY_JS = "(()=>{var re=/^(A\s*更好|B\s*更好|都好|都不好|A is better|B is better|Tie|Both are bad|Both are good)$/i;var bs=[].slice.call(document.querySelectorAll('button'));return bs.filter(function(b){return re.test((b.innerText||'').trim())}).length>=2})()";
+const VOTE_RE = {
+  a: /^A\s*更好$|^A is better$/i,
+  b: /^B\s*更好$|^B is better$/i,
+  tie: /^都好$|^Tie$|^Both are good$/i,
+  both: /^都不好$|^Both are bad$/i,
+};
+const ANON_LABEL_RE = /^(助手|assistant)\s*[AB]$/i;
+// 模型按钮渲染出来才算页面水合完成：过早输入时 React 还没挂上发送处理器
+const MODELS_READY_JS = "(()=>{var bs=[].slice.call(document.querySelectorAll('button'));var m=bs.filter(function(b){var t=(b.innerText||'').trim();return t.length>3&&t.length<40&&/^(gemini|gpt|claude|glm|qwen|kimi|grok|deepseek|mimo|muse|inkling|mistral|auto|max)/i.test(t)});return m.length>=2})()";
+
+async function readBattlePanes(c) {
+  const raw = await c.ev(BATTLE_PANES_JS).catch(() => '');
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+const NOT_READY_RE = /^(Generating|生成中|Thinking|思考中)[.…]*$/i;
+const paneReady = (t) => !!t && !NOT_READY_RE.test(String(t).trim());
+
+async function askBattle(s, prompt) {
+  const c = s.cdp;
+  if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+  if (!(await c.ev(READY_JS))) await waitReady(c);
+  for (let i = 0; i < 24; i++) { if (await c.ev(MODELS_READY_JS).catch(() => false)) break; await sleep(500); }
+  await sleep(600);
+  if (await isGenerating(c)) { await stopGeneration(c); await sleep(800); }
+  await typePrompt(c, prompt);
+  const t0 = Date.now();
+  let lastSig = '', changedAt = Date.now(), sawSendStuck = 0;
+  while (Date.now() - t0 < ASK_MAX_MS) {
+    await sleep(POLL_MS);
+    if (c.closed) throw new Error('tab closed');
+    if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+    const p = await readBattlePanes(c);
+    if (p && paneReady(p.a.text) && paneReady(p.b.text)) {
+      if (await c.ev(VOTE_READY_JS)) return p;
+      const sig = p.a.text.length + ':' + p.b.text.length;
+      if (sig !== lastSig) { lastSig = sig; changedAt = Date.now(); }
+      else if (Date.now() - changedAt > 8000) return p;  // 投票条没渲染也别卡死
+    } else if (!p) {
+      const left = await c.ev(VAL_JS).catch(() => 0);
+      if (left > 1) {
+        sawSendStuck++;
+        if (sawSendStuck === 3) log('warn: composer holds text after send, keep waiting');
+      }
+    }
+  }
+  throw new Error('battle timeout: no two answers');
+}
+
+async function voteBattle(c, choice) {
+  const re = VOTE_RE[choice];
+  if (!re) throw new Error('bad choice');
+  const raw = await c.ev("(function(){var re=new RegExp(" + JSON.stringify(re.source) + ",'i');var bs=[].slice.call(document.querySelectorAll('button'));for(var i=0;i<bs.length;i++){var t=(bs[i].innerText||'').trim();if(re.test(t)){var r=bs[i].getBoundingClientRect();if(r.width>0&&r.height>0)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}}return ''})()").catch(() => '');
+  if (!raw || raw.charAt(0) !== '{') throw new Error('vote button not found (already voted?)');
+  await realClick(c, JSON.parse(raw));
+  await sleep(1200);
+  for (let i = 0; i < 12; i++) {
+    const p = await readBattlePanes(c);
+    if (p && p.a.label && !ANON_LABEL_RE.test(p.a.label)) return p;
+    await sleep(500);
+  }
+  return await readBattlePanes(c);
 }
 
 /* ---------- queue ---------- */
@@ -866,6 +969,59 @@ const server = http.createServer(async (req, res) => {
     };
     // 同样走队列：上传要往输入框里塞文件，和正在生成的回答抢页面必然打架
     return enqueue(doUp).then(r => send(200, r)).catch(e => send(e && e.busy ? 429 : 500, { error: e.message }));
+  }
+  if (u.pathname === '/battle' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
+    const prompt = String(body.prompt || '').trim();
+    if (!prompt) return send(400, { ok: false, error: 'empty prompt' });
+    const session = body.session || DEFAULT_SESSION;
+    const mode = body.mode === 'side' ? 'side' : 'battle';
+    const models = Array.isArray(body.models) ? body.models.map(String).filter(Boolean).slice(0, 2) : [];
+    // 对战标签页独立于 agent/direct 的聊天页，用后缀区分，免得互相抢页面
+    const key = session + '#battle';
+    const opts = { mode, models, fresh: true };
+    const run = async () => {
+      if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      const s = await getSession(key, opts);
+      s.busy = true;
+      try {
+        const gap = Date.now() - (s.lastAsk || 0);
+        if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
+        s.lastAsk = Date.now();
+        const p = await askBattle(s, prompt);
+        battleRounds.set(session, { panes: p, mode, at: Date.now() });
+        return p;
+      } finally {
+        s.busy = false;
+      }
+    };
+    try {
+      const p = await enqueue(run);
+      minimizeChrome();
+      return send(200, { ok: true, session, mode, a: p.a, b: p.b });
+    } catch (e) {
+      minimizeChrome();
+      log('battle error:', e.message);
+      return send(/NEED_VERIFY/.test(e.message) ? 409 : (e.busy ? 429 : 500), { ok: false, error: e.message });
+    }
+  }
+  if (u.pathname === '/vote' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
+    const session = body.session || DEFAULT_SESSION;
+    const choice = String(body.choice || '').toLowerCase();
+    if (!VOTE_RE[choice]) return send(400, { ok: false, error: 'choice must be a|b|tie|both' });
+    const s = sessions.get(session + '#battle');
+    if (!s) return send(404, { ok: false, error: 'no battle round for this session' });
+    try {
+      const p = await enqueue(() => voteBattle(s.cdp, choice));
+      const round = battleRounds.get(session);
+      if (round) { round.voted = choice; round.revealed = p; }
+      return send(200, { ok: true, choice, a: p.a, b: p.b });
+    } catch (e) {
+      return send(/NEED_VERIFY/.test(e.message) ? 409 : 500, { ok: false, error: e.message });
+    }
   }
   if (u.pathname === '/new') {
     const name = u.searchParams.get('session') || DEFAULT_SESSION;

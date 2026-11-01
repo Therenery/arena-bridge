@@ -890,8 +890,14 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     const fresh = body.arena_new === true || body.arena_continue === false;
     // 标签页重建过（LRU 淘汰 / 出错重置）时页面自己没上下文，得把服务端历史补回去，
     // 否则用户在对话中途会遇到「它怎么忘了刚才说的」这种无声失忆
-    const needReplay = fresh || contextLost.has(name);
-    const useHist = needReplay ? (bodyPrior && bodyPrior.length ? bodyPrior : (srvPrior.length ? srvPrior : null)) : null;
+    // 进程刚起、标签页被 LRU 淘汰或重建过时，页面里没有上下文；
+    // 只有这种情况才需要把客户端带来的历史回放进去。
+    const needReplay = fresh || contextLost.has(name) || !sessions.has(name);
+    // 新会话（fresh）没有客户端历史时，绝不能用服务端历史回填：那是上一个会话
+    // 的内容，塞进新标签页会让模型把旧对话当成当前上下文，看起来就是「串台」。
+    const useHist = needReplay
+      ? (bodyPrior && bodyPrior.length ? bodyPrior : (fresh ? null : (srvPrior.length ? srvPrior : null)))
+      : null;
     if (needReplay && !useHist) log('replay skipped, no history for ' + name);
     let prompt = last;
     if (useHist) {

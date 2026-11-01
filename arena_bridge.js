@@ -1088,7 +1088,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       log('PROMPT len=' + prompt.length);
     }
     const truncated = prompt.length > MAX_PROMPT_CHARS;
-    const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', fresh };
+    const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', models: (function (m) { if (Array.isArray(m)) return m.map(String).filter(Boolean).slice(0, 2); if (typeof m === 'string' && m) return m.split(',').map(function (x) { return x.trim(); }).filter(Boolean).slice(0, 2); return []; })(body.metadata && body.metadata.models), fresh };
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
     const created = Math.floor(Date.now() / 1000);
@@ -1103,6 +1103,26 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
 
     const run = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      // 常驻 battle/side 模式：普通提问也走并排，两栏答案合成一条消息
+      if (opts.mode === 'battle' || opts.mode === 'side') {
+        const key = name + '#battle';
+        if (!(await ensureChrome())) throw new Error('chrome unavailable');
+        const s2 = await getSession(key, { mode: opts.mode, models: opts.models, fresh: true });
+        live = s2;
+        s2.busy = true;
+        try {
+          const gap = Date.now() - (s2.lastAsk || 0);
+          if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
+          s2.lastAsk = Date.now();
+          const p = await askBattle(s2, prompt);
+          battleRounds.set(name, { panes: p, mode: opts.mode, at: Date.now() });
+          const text = '**A · ' + (p.a.label || 'A') + '**\n\n' + (p.a.text || '') + '\n\n---\n\n**B · ' + (p.b.label || 'B') + '**\n\n' + (p.b.text || '') + '\n\n投票：/vote a | b | tie | both';
+          if (wantStream) chunk({ content: text });
+          return { text };
+        } finally {
+          s2.busy = false;
+        }
+      }
       const s = await getSession(name, opts);
       live = s;
       s.busy = true;   // 淘汰与退出都看这个字段，别把正在跑的会话连根拔掉

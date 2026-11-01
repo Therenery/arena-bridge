@@ -437,12 +437,20 @@ async function typePrompt(c, text) {
     log('WARN prompt truncated ' + text.length + ' -> ' + MAX_PROMPT_CHARS + ' chars');
   }
   const body = text.slice(0, MAX_PROMPT_CHARS);
-  for (let i = 0; i < body.length; i++) {
-    await c.send('Input.dispatchKeyEvent', { type: 'char', text: body.charAt(i) });
-    if (i % 25 === 24) await sleep(20);
+  const want = body.replace(/[\s\u00a0\u200b]/g, '').length;
+  // 一次插入整段：逐字符发键事件要几十秒，长 prompt 期间页面容易自己跳走
+  await c.send('Input.insertText', { text: body });
+  await sleep(500);
+  let n = await c.ev(VAL_JS);
+  if (n < Math.max(1, Math.floor(want * 0.9))) {
+    // 回退：部分编辑器不吃 insertText，退回逐字符
+    for (let i = 0; i < body.length; i++) {
+      await c.send('Input.dispatchKeyEvent', { type: 'char', text: body.charAt(i) });
+      if (i % 25 === 24) await sleep(20);
+    }
+    await sleep(700);
+    n = await c.ev(VAL_JS);
   }
-  await sleep(700);
-  const n = await c.ev(VAL_JS);
   log('typed len=' + n + ' url=' + String(await c.ev('location.href')).slice(0, 60));
   if (!n) throw new Error('typing failed (editor empty after insert)');
   let ok = await clickSend(c);

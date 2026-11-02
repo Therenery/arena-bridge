@@ -112,7 +112,7 @@ data: [DONE]
 
 1. **等待过程要有阶段感。** `arena "问题"` 现在只有一行「已等 N 秒」+ 轮转数字，最长要等 5 分钟。桥这边其实知道自己在干什么，建议 `/health` 增加 `stage`（`queueing / opening-tab / waiting-ready / typing / generating / review-state`）和 `current`（会话名、已用时间），`arena doctor` 直接读出来。这样「卡住了」和「在跑工具」能一眼分开。
 2. **冷启动要解释。** Chrome 没起来时固定等 60 秒（40 × 1.5s），CLI 侧完全没提示。建议 `/health` 返回 `chromeStarting: true`，CLI 打一行「正在拉起 Chrome，最多 60 秒」。
-3. **队列语义要在返回里说清楚。** 排队上限 4、并发恒为 1，客户端以为能并发 4 个。建议 429 时带 `Retry-After`（按当前一轮的预估剩余时间，至少 30s），aichat/Qwen Code 这类客户端会自己退避。
+3. **队列语义要在返回里说清楚。** 排队上限 4、并发恒为 1，客户端以为能并发 4 个。建议 429 时带 `Retry-After`（按当前一轮的预估剩余时间，至少 30s），aichat/Arena Code 这类客户端会自己退避。
 4. **错误文案分三层。** 现在 CLI 只把 `NEED_VERIFY`、`busy`、`chrome` 三类翻译成中文，其它原样打印。建议把 `sessionBroken` 那一组（composer 卡住 / 标签页关了）也翻译成「页面状态异常，已重置会话，重发即可」，否则用户会以为是内容问题。
 5. **`arena new` 默认清当前会话而不是固定 `main`。** `arena -s 设计 "..."` 之后要清 `设计`，还得记得加参数。
 6. **REPL/TUI 里显示思考片段而不是空白。** 桥已经在推 `reasoning_content` 与工具调用行（`· bash {...}`），aichat 会显示在思考区；但 TUI 那条链路依赖那个不存在的适配器。打通后这些信息是「长任务不像卡死」的关键。

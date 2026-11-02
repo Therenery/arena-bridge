@@ -29,6 +29,7 @@ arena_bridge.js（node，无第三方依赖）
 | 文件 | 作用 |
 |---|---|
 | `arena_bridge.js` | 主服务，监听 127.0.0.1:17892 |
+| `arena-code/` | 独立实现的 Arena Code 终端（零第三方依赖），含流式聊天、会话保存与 `/repo`、`/upload`、`/vote` 命令 |
 | `arb.ps1` | Windows 侧调用入口，收 base64 问题、写结果 JSON |
 | `rd2.js` | 结果回传，gzip + base64 绕开 ssh 中文乱码 |
 | `start_bridge.ps1` / `start-arena-chrome.cmd` | 启动脚本，供计划任务调用 |
@@ -140,51 +141,55 @@ arena repo Therenery/Backrooms # 切换工作区仓库（等于开新对话）
 arena chat -R Therenery/xxx    # 进 REPL 前先切
 ```
 
-## Arena Code：Windows 终端界面（Qwen Code）
+## Arena Code：独立终端界面
 
-终端这一层用 Qwen Code 的 TUI 当外壳（Apache-2.0，自带 OpenAI 兼容 provider），只把它当键盘和显示器：提示词、工具调用一律不参与，真正干活的是 Arena 页面里的 Agent。
+Arena Code 是本仓库内独立实现的终端，只使用 Node.js 标准库，不依赖任何外部 TUI 工程或补丁。它只负责输入、流式显示和少量桥命令；系统提示词、工作区上下文和工具执行仍由 Arena 页面里的 Agent 负责。
 
-### 为什么不是 Codex
+### 启动
 
-Codex 的 TUI 按固定宽度排版，Termux 88 列下会崩；Qwen Code 的 TUI 能自适应，且 packages/core/src/core/openaiContentGenerator/ 已经内置 OpenAI 兼容实现，接桥只需配 base_url。
+在桥已启动的情况下：
+
+```bash
+npm run code
+npm run code -- "问题"
+node arena-code/bin/arena-code.js --help
+```
+
+Windows 下运行 `cli-windows\arena.cmd`（可放进 PATH 后直接敲 `arena`）。启动器会体检 17892，没起来就按脚本位置拉起仓库根目录的 `arena_bridge.js`，然后进入仓库内的 `arena-code/bin/arena-code.js`。
 
 ### 客户端配置
 
-%USERPROFILE%\.arena\settings.json：
+默认读取 `%USERPROFILE%\.arena\settings.json`（其它系统为 `~/.arena/settings.json`）：
 
 ~~~json
 {
-  "modelProviders": {
-    "openai": [
-      {
-        "id": "arena-agent",
-        "name": "Arena Agent",
-        "baseUrl": "http://127.0.0.1:17892/v1",
-        "envKey": "ARENA_API_KEY"
-      }
-    ]
-  },
-  "model": { "name": "arena-agent", "baseUrl": "http://127.0.0.1:17892/v1" },
-  "security": { "auth": { "selectedType": "openai" } },
-  "env": { "ARENA_API_KEY": "sk-arena-local" }
+  "bridgeUrl": "http://127.0.0.1:17892",
+  "model": "arena-agent",
+  "mode": "agent",
+  "session": "main",
+  "stream": true,
+  "showReasoning": true,
+  "saveSession": true,
+  "apiKeyEnv": "ARENA_API_KEY"
 }
 ~~~
 
-cli-windows\arena.cmd 放进 PATH（例如 E:\Programz\bin），敲 arena 即进界面：
-
-- 体检 17892，没起来就拉起 arena_bridge.js
-- ARENA_SYSTEM_MD 指向空文件，客户端不再自带系统提示词
-- 工作目录切到空目录，避免把 AGENTS.md 之类带进对话
+旧版 provider 风格 settings（`modelProviders.openai[].baseUrl/id/envKey`、`model.name`、`env`）仍会被自动转换。命令行参数和环境变量优先于文件；详细变量见 `arena-code/README.md`。会话保存在 `~/.arena/sessions/`，且客户端不会主动注入系统提示词或本地工程上下文。
 
 ### 常用命令
 
 | 命令 | 作用 |
 | --- | --- |
+| `/status` | 查看桥、Chrome、模型与会话状态 |
+| `/model <名字>`、`/mode <模式>` | 切换模型或 agent / direct / battle / side 模式 |
+| `/session <名字>`、`/new` | 切换或新建桥会话 |
 | `/repo` | 列出 Arena 工作区里可切换的仓库 |
 | `/repo owner/name` | 切换到指定仓库（会重建会话） |
 | `/upload <路径>` | 把本地文件挂到 Arena 输入框，路径带空格时用引号 |
+| `/vote a|b|tie|both` | 给最近一次 Battle 投票并揭晓两边模型 |
 
-思考过程、工具调用、路由模型会以 `·` 开头的行显示在思考区。
+思考过程、工具调用和路由信息会以弱化样式显示；非交互模式下它们走 stderr，正文走 stdout。
+
 ### 发送机制（踩过的坑）
 
 Arena 的输入框是 tiptap/ProseMirror。只有逐字符的真实键盘事件会更新它的内部状态：
@@ -200,21 +205,19 @@ Arena 的输入框是 tiptap/ProseMirror。只有逐字符的真实键盘事件�
 另外两个必须清掉的东西：
 
 - 客户端的 system 消息：Arena 页面自带系统提示词，客户端再塞一份会互相打架，桥里直接丢弃。
-- 客户端注入的上下文：Qwen Code 会往 user 消息里塞 --- Context from: ... --- 和 <system-reminder>，一次两万字，Arena 只会回一句「需要我做什么」。桥里用正则剥掉。
+- 客户端注入的上下文：某些通用客户端会往 user 消息里塞 --- Context from: ... --- 和 <system-reminder>，一次两万字，Arena 只会回一句「需要我做什么」。桥里用正则剥掉。
 
 ### 新会话
 
 新会话就是导航到 https://arena.ai/agent （不带会话 id）。仓库/连接器选择是账号级状态，新会话自动继承，/repo 只在需要换库时用。
 
-### 从源码构建（开源版）
+### 开发与测试
+
+Arena Code 不需要构建：
 
 ~~~powershell
-git clone --depth 1 https://github.com/QwenLM/qwen-code.git
-cd qwen-code
-git apply F:\path\to\arena-bridge\patches\arena-code.patch
-corepack pnpm install
-corepack pnpm run build
+node arena-code/bin/arena-code.js --help
+node --test arena-code/test/arena-code.test.js
 ~~~
 
-补丁做四件事：把内置 banner 换成 ARENA 字符画（青色→靛紫渐变）、标题改 Arena Code、清掉所有俏皮加载文案、程序名改成 arena。
-
+源码位于 `arena-code/src/`，入口为 `arena-code/bin/arena-code.js`；配置、命令解析、SSE 解析、桥客户端和会话存储均有对应模块与 `node:test` 覆盖。

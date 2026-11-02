@@ -538,7 +538,7 @@ function normalizeMode(m) {
 }
 
 // 虚拟模型名 arena-agent / arena-direct 不是「模型」，是模式开关。
-// 以前 /v1 只看 metadata.mode：aichat/Qwen 里选 arena-direct 其实还在跑 agent 页
+// 以前 /v1 只看 metadata.mode：aichat/Arena Code 里选 arena-direct 其实还在跑 agent 页
 function resolveV1Target(body) {
   const meta = (body && body.metadata) || {};
   const rawModel = (body && body.model) || '';
@@ -728,7 +728,7 @@ const VOTE_RE = {
 };
 const ANON_LABEL_RE = /^(助手|assistant)\s*[AB]$/i;
 // 模型按钮渲染出来才算页面水合完成：过早输入时 React 还没挂上发送处理器
-const MODELS_READY_JS = "(()=>{var bs=[].slice.call(document.querySelectorAll('button'));var m=bs.filter(function(b){var t=(b.innerText||'').trim();return t.length>3&&t.length<40&&/^(gemini|gpt|claude|glm|qwen|kimi|grok|deepseek|mimo|muse|inkling|mistral|auto|max)/i.test(t)});return m.length>=2})()";
+const MODELS_READY_JS = "(()=>{var bs=[].slice.call(document.querySelectorAll('button'));var m=bs.filter(function(b){var t=(b.innerText||'').trim();return t.length>3&&t.length<40&&/^(gemini|gpt|claude|glm|kimi|grok|deepseek|mimo|muse|inkling|mistral|auto|max)/i.test(t)});return m.length>=2})()";
 
 async function readBattlePanes(c) {
   const raw = await c.ev(BATTLE_PANES_JS).catch(() => '');

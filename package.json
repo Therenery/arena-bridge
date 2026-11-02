@@ -4,8 +4,12 @@
   "private": true,
   "description": "把 arena.ai 的 Agent 模式接进本地工作流的拦截式桥接服务",
   "main": "arena_bridge.js",
+  "bin": {
+    "arena-code": "arena-code/bin/arena-code.js"
+  },
   "scripts": {
     "start": "node arena_bridge.js",
+    "code": "node arena-code/bin/arena-code.js",
     "test": "node --test"
   },
   "engines": {

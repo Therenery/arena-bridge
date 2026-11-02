@@ -1,0 +1,18 @@
+{
+  "name": "arena-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Arena Bridge 的独立终端客户端",
+  "license": "UNLICENSED",
+  "main": "src/cli.js",
+  "bin": {
+    "arena-code": "bin/arena-code.js"
+  },
+  "scripts": {
+    "start": "node bin/arena-code.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=21"
+  }
+}

@@ -9,7 +9,7 @@ MODEL=''
 SHOW_REASON=0
 PS1WIN='F:\__AI__\work\arb.ps1'
 RDWIN='F:\__AI__\work\rd2.js'
-OUTWIN='F:\__AI__\tmp\last.json'
+OUTWIN="F:\__AI__\tmp\last-$$.json"
 
 usage() {
   cat <<'EOF'
@@ -71,7 +71,9 @@ else
   printf '[%s/%s] 已发送，等待中\n' "$MODE" "$SESSION" >&2
 fi
 
-pc "$CMD" > /tmp/.arena.ps.out 2>/dev/null &
+PSOUT=$(mktemp /tmp/.arena.ps.out.XXXXXX)
+trap 'rm -f "$PSOUT"' EXIT
+pc "$CMD" > "$PSOUT" 2>/dev/null &
 PID=$!
 N=0
 while kill -0 "$PID" 2>/dev/null; do
@@ -88,8 +90,8 @@ done
 wait "$PID" 2>/dev/null
 [ -t 2 ] && printf '\r\033[K' >&2
 
-if ! grep -q '^OK ' /tmp/.arena.ps.out 2>/dev/null; then
-  MSG=$(grep '^ERR ' /tmp/.arena.ps.out 2>/dev/null | head -1 | sed 's/^ERR //')
+if ! grep -q '^OK ' "$PSOUT" 2>/dev/null; then
+  MSG=$(grep '^ERR ' "$PSOUT" 2>/dev/null | head -1 | sed 's/^ERR //')
   [ -z "$MSG" ] && MSG="请求失败（pc 通道或服务端异常）"
   case "$MSG" in
     *NEED_VERIFY*) echo "需要人工验证：Arena 弹了人机验证，去电脑上的 Chrome 点一下再重试。" ;;

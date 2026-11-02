@@ -84,9 +84,10 @@ const repoPosJs = name => "(function(){var d=document.querySelector('[role=dialo
 function cdpApi(method, path) {
   return new Promise((res, rej) => {
     const req = http.request({ host: '127.0.0.1', port: CDP_PORT, path, method, timeout: 8000 }, r => {
-      let b = '';
-      r.on('data', d => (b += d));
-      r.on('end', () => { try { res(JSON.parse(b)); } catch (e) { res(b); } });
+      // 先攒 Buffer 再整体解码：逐 chunk 字符串拼接会把跨 TCP 包的多字节字符切成 �
+      const parts = [];
+      r.on('data', d => parts.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+      r.on('end', () => { const b = Buffer.concat(parts).toString('utf8'); try { res(JSON.parse(b)); } catch (e) { res(b); } });
     });
     req.on('timeout', () => { req.destroy(new Error('cdp timeout')); });
     req.on('error', rej);
@@ -157,7 +158,7 @@ const INJECT = String.raw`
             var b = null;
             try { b = JSON.parse(o.records[i].body); } catch (e) { continue; }
             var d = (b && b.data) || {};
-            if (d.type) push(st, { e: d.type, d: (typeof d.delta === 'string' ? d.delta : ''), n: d.toolName || '', i: d.input || null, t: Date.now() });
+            if (d.type) push(st, { e: d.type, d: (typeof d.delta === 'string' ? d.delta : ''), n: d.toolName || '', i: d.input || null, m: (d.type === 'error' ? String(d.errorText || d.message || JSON.stringify(d)).slice(0, 300) : ''), t: Date.now() });
           }
           return;
         }
@@ -168,7 +169,7 @@ const INJECT = String.raw`
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
     const req = args[0];
-    const url = typeof req === 'string' ? req : (req && req.url) || '';
+    const url = typeof req === 'string' ? req : ((req && req.url) || (req ? String(req) : ''));
     const res = await origFetch.apply(this, args);
     try {
       if (interesting(url)) {
@@ -202,10 +203,16 @@ const INJECT = String.raw`
     if (interesting(String(this.__arbU || ''))) {
       const st = { id: ++window.__arbSeq, u: String(this.__arbU), status: 0, t: Date.now(), frames: [] };
       window.__arbStreams.push(st);
-      this.addEventListener('progress', () => {
-        try { const t = this.responseText || ''; const nl = t.lastIndexOf('\n'); if (nl > 0) note(st, t.slice(0, nl)); } catch (e) {}
-      });
-      this.addEventListener('load', () => { st.done = true; });
+      var seen = 0;
+      var drain = (final) => {
+        try {
+          const t = this.responseText || '';
+          const nl = final ? t.length : t.lastIndexOf('\n') + 1;
+          if (nl > seen) { const seg = t.slice(seen, nl); seen = nl; for (const ln of seg.split('\n')) { if (ln.trim()) note(st, ln); } }
+        } catch (e) {}
+      };
+      this.addEventListener('progress', () => drain(false));
+      this.addEventListener('load', () => { drain(true); st.done = true; });
     }
     return xsend.apply(this, arguments);
   };
@@ -436,20 +443,30 @@ async function typePrompt(c, text) {
   if (text.length > MAX_PROMPT_CHARS) {
     log('WARN prompt truncated ' + text.length + ' -> ' + MAX_PROMPT_CHARS + ' chars');
   }
-  const body = text.slice(0, MAX_PROMPT_CHARS);
+  let body = text.slice(0, MAX_PROMPT_CHARS);
+  // 别把 emoji 这类代理对从截断点劈成两半（孤立的高代理码元发到编辑器里是乱码）
+  if (body.length) { const cc = body.charCodeAt(body.length - 1); if (cc >= 0xd800 && cc <= 0xdbff) body = body.slice(0, -1); }
   const want = body.replace(/[\s\u00a0\u200b]/g, '').length;
   // 一次插入整段：逐字符发键事件要几十秒，长 prompt 期间页面容易自己跳走
   await c.send('Input.insertText', { text: body });
   await sleep(500);
   let n = await c.ev(VAL_JS);
   if (n < Math.max(1, Math.floor(want * 0.9))) {
-    // 回退：部分编辑器不吃 insertText，退回逐字符
-    for (let i = 0; i < body.length; i++) {
-      await c.send('Input.dispatchKeyEvent', { type: 'char', text: body.charAt(i) });
-      if (i % 25 === 24) await sleep(20);
+    // 回退前必须先清空：insertText 可能已经进了一部分，
+    // 直接补敲全文会把「半截 + 全文」拼在一起发出去
+    await keyCombo(c, 2, 'a', 'KeyA', 65);
+    await sleep(80);
+    await keyCombo(c, 0, 'Backspace', 'Backspace', 8);
+    await sleep(250);
+    // 回退：部分编辑器不吃 insertText，退回逐字符（按码点发，charAt 会劈开代理对）
+    let i = 0;
+    for (const ch of body) {
+      await c.send('Input.dispatchKeyEvent', { type: 'char', text: ch });
+      if (++i % 25 === 0) await sleep(20);
     }
     await sleep(700);
     n = await c.ev(VAL_JS);
+    if (n < Math.max(1, Math.floor(want * 0.9))) log('WARN typed length mismatch got=' + n + ' want=' + want);
   }
   log('typed len=' + n + ' url=' + String(await c.ev('location.href')).slice(0, 60));
   if (!n) throw new Error('typing failed (editor empty after insert)');
@@ -508,6 +525,37 @@ function setHistory(name, h) {
   while (histories.size > MAX_HISTORY_KEYS) histories.delete(histories.keys().next().value);
 }
 
+// battleRounds 的键同样来自客户端，不给上限的话换着 session 名就能把对战正文无限攒在内存里
+function setBattleRound(name, round) {
+  battleRounds.delete(name);
+  battleRounds.set(name, round);
+  while (battleRounds.size > MAX_HISTORY_KEYS) battleRounds.delete(battleRounds.keys().next().value);
+}
+
+// 模式只认这四种；拼错的 metadata.mode 以前会被原样存进 session，页面按 agent 开、记录按错的算
+function normalizeMode(m) {
+  return (m === 'direct' || m === 'side' || m === 'battle') ? m : 'agent';
+}
+
+// 虚拟模型名 arena-agent / arena-direct 不是「模型」，是模式开关。
+// 以前 /v1 只看 metadata.mode：aichat/Qwen 里选 arena-direct 其实还在跑 agent 页
+function resolveV1Target(body) {
+  const meta = (body && body.metadata) || {};
+  const rawModel = (body && body.model) || '';
+  const byModel = rawModel === 'arena-direct' ? 'direct' : rawModel === 'arena-agent' ? 'agent' : null;
+  const mode = normalizeMode(meta.mode || byModel || 'agent');
+  const model = (!rawModel || rawModel === 'auto' || byModel) ? '' : String(rawModel);
+  const models = Array.isArray(meta.models)
+    ? meta.models.map(String).filter(Boolean).slice(0, 2)
+    : (typeof meta.models === 'string' && meta.models ? meta.models.split(',').map(x => x.trim()).filter(Boolean).slice(0, 2) : []);
+  return { mode, model, models };
+}
+
+function sessionName(v) {
+  const s = (v == null ? '' : String(v)).trim();
+  return s || DEFAULT_SESSION;
+}
+
 async function resetSession(name, why) {
   const s = sessions.get(name);
   if (!s) return;
@@ -515,6 +563,7 @@ async function resetSession(name, why) {
   try { s.cdp.close(); } catch (e) {}
   sessions.delete(name);
   if (histories.has(name)) contextLost.add(name);
+  if (String(name).endsWith('#battle')) battleRounds.delete(String(name).slice(0, -'#battle'.length));
   log('session reset ' + name + (why ? ' (' + why + ')' : ''));
 }
 
@@ -531,13 +580,25 @@ async function evictSessions(keepKey) {
     try { s.cdp.close(); } catch (e) {}
     sessions.delete(k);
     histories.delete(k);
+    if (String(k).endsWith('#battle')) battleRounds.delete(String(k).slice(0, -'#battle'.length));
   }
 }
 
 async function getSession(name, opts) {
   const key = name || DEFAULT_SESSION;
+  const wantMode = normalizeMode(opts && opts.mode);
+  const wantModel = (opts && opts.model) || '';
   let s = sessions.get(key);
   if (s && opts.fresh) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(key); s = null; }
+  if (s && (s.mode !== wantMode || (wantModel && s.model !== wantModel))) {
+    // 标签页是按模式/模型开的，只按名字复用会让「切到 direct/换模型」静默无效：
+    // 页面还在旧模式里答题，调用方以为已经切换了
+    log('session ' + key + ' target changed ' + s.mode + '/' + (s.model || '-') + ' -> ' + wantMode + '/' + (wantModel || '-'));
+    try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {}
+    try { s.cdp.close(); } catch (e) {}
+    sessions.delete(key); s = null;
+    if (histories.has(key)) contextLost.add(key);
+  }
   if (s) {
     const alive = await s.cdp.ev("1+1").catch(() => null);
     if (alive === 2) return s;
@@ -549,7 +610,7 @@ async function getSession(name, opts) {
   await evictSessions(key);
   let r = null;
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { r = await openTab(opts.model, opts.mode, opts.models); break; }
+    try { r = await openTab(wantModel, wantMode, opts.models); break; }
     catch (e) {
       log('openTab failed #' + attempt + ': ' + e.message);
       if (attempt === 2) throw e;
@@ -557,7 +618,7 @@ async function getSession(name, opts) {
       await ensureChrome();
     }
   }
-  s = { name: key, tabId: r.tabId, cdp: r.cdp, model: opts.model || '', mode: opts.mode || 'direct', lastAsk: 0, busy: false };
+  s = { name: key, tabId: r.tabId, cdp: r.cdp, model: wantModel, mode: wantMode, lastAsk: 0, busy: false };
   sessions.set(key, s);
   return s;
 }
@@ -582,6 +643,10 @@ async function askOnce(s, prompt, onDelta, ctx) {
   const t0 = Date.now();
   let text = '', reasoning = '', done = false, routed = '', tick = 0, doneNoTextAt = 0, doneSeen = false;
   const cursors = new Map();
+  // 哪些流已经出过内容要记在跨轮询存活的地方。以前记在 st.hasOut 上，
+  // 而 st 是 listStreams 每轮 JSON.parse 出来的新对象，下一轮就没了：
+  // 流在两轮之间结束且没带 finish/ad 帧时，doneSeen 永远等不到，只能耗到 5 分钟 stalled
+  const outStreams = new Set();
   const tools = [];
   let lastFrameAt = Date.now();
 
@@ -631,10 +696,10 @@ async function askOnce(s, prompt, onDelta, ctx) {
       if (r.f && r.f.length) {
         cursors.set(st.id, r.n); lastFrameAt = Date.now();
         for (const f of r.f) {
-          if (applyFrame(f).out) st.hasOut = true;
+          if (applyFrame(f).out) outStreams.add(st.id);
         }
       }
-      if (r.done && st.hasOut) anyDone = true;
+      if (r.done && outStreams.has(st.id)) anyDone = true;
     }
     if (anyDone) doneSeen = true;
     if (done) break;
@@ -668,14 +733,18 @@ const MODELS_READY_JS = "(()=>{var bs=[].slice.call(document.querySelectorAll('b
 async function readBattlePanes(c) {
   const raw = await c.ev(BATTLE_PANES_JS).catch(() => '');
   if (!raw) return null;
-  try { return JSON.parse(raw); } catch (e) { return null; }
+  try {
+    const p = JSON.parse(raw);
+    return (p && p.a && p.b && typeof p.a.text === 'string' && typeof p.b.text === 'string') ? p : null;
+  } catch (e) { return null; }
 }
 
 const NOT_READY_RE = /^(Generating|生成中|Thinking|思考中)[.…]*$/i;
 const paneReady = (t) => !!t && !NOT_READY_RE.test(String(t).trim());
 
-async function askBattle(s, prompt) {
+async function askBattle(s, prompt, ctx) {
   const c = s.cdp;
+  const aborted = () => !!(ctx && ctx.aborted && ctx.aborted());
   if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
   if (!(await c.ev(READY_JS))) await waitReady(c);
   for (let i = 0; i < 24; i++) { if (await c.ev(MODELS_READY_JS).catch(() => false)) break; await sleep(500); }
@@ -683,22 +752,30 @@ async function askBattle(s, prompt) {
   if (await isGenerating(c)) { await stopGeneration(c); await sleep(800); }
   await typePrompt(c, prompt);
   const t0 = Date.now();
-  let lastSig = '', changedAt = Date.now(), sawSendStuck = 0;
+  let lastSig = '', stableSig = '', changedAt = Date.now(), lastProgressAt = Date.now(), stuckSince = 0;
   while (Date.now() - t0 < ASK_MAX_MS) {
     await sleep(POLL_MS);
     if (c.closed) throw new Error('tab closed');
+    if (aborted()) { throw Object.assign(new Error('aborted by client'), { aborted: true }); }
     if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
     const p = await readBattlePanes(c);
+    // 只要两栏内容还在变就是有进展；长时间纹丝不动按卡死处理，
+    // 不能像以前一样一路等满 ASK_MAX_MS（2 小时）把全局队列占死
+    const progressSig = p ? ((p.a.label || '') + ':' + p.a.text.length + ':' + (p.b.label || '') + ':' + p.b.text.length) : 'none';
+    if (progressSig !== lastSig) { lastSig = progressSig; lastProgressAt = Date.now(); }
+    if (Date.now() - lastProgressAt > ASK_IDLE_MS) throw new Error('battle stalled: no pane change for ' + Math.round(ASK_IDLE_MS / 1000) + 's');
     if (p && paneReady(p.a.text) && paneReady(p.b.text)) {
       if (await c.ev(VOTE_READY_JS)) return p;
       const sig = p.a.text.length + ':' + p.b.text.length;
-      if (sig !== lastSig) { lastSig = sig; changedAt = Date.now(); }
+      if (sig !== stableSig) { stableSig = sig; changedAt = Date.now(); }
       else if (Date.now() - changedAt > 8000) return p;  // 投票条没渲染也别卡死
     } else if (!p) {
       const left = await c.ev(VAL_JS).catch(() => 0);
       if (left > 1) {
-        sawSendStuck++;
-        if (sawSendStuck === 3) log('warn: composer holds text after send, keep waiting');
+        if (!stuckSince) { stuckSince = Date.now(); log('warn: composer holds text after battle send'); }
+        else if (Date.now() - stuckSince > 45000) throw new Error('battle send failed (composer still holds text)');
+      } else {
+        stuckSince = 0;
       }
     }
   }
@@ -746,11 +823,27 @@ async function pump() {
 /* ---------- http ---------- */
 function readBody(req) {
   return new Promise((res, rej) => {
-    let b = ''; let n = 0;
-    req.on('data', d => { n += d.length; if (n > 4 * 1024 * 1024) { rej(new Error('body too large')); req.destroy(); } b += d; });
-    req.on('end', () => res(b));
-    req.on('error', rej);
+    // 先攒 Buffer 再整体解码。以前 `b += d` 是逐 chunk toString，
+    // 中文 UTF-8 字节一旦跨 TCP 包就会被切成 �（隧道/大 prompt 时正文静默损坏）
+    const parts = [];
+    let n = 0; let settled = false;
+    req.on('data', d => {
+      if (settled) return;
+      n += d.length;
+      if (n > 4 * 1024 * 1024) { settled = true; rej(new Error('body too large')); req.destroy(); return; }
+      parts.push(Buffer.isBuffer(d) ? d : Buffer.from(d));
+    });
+    req.on('end', () => { if (!settled) { settled = true; res(Buffer.concat(parts).toString('utf8')); } });
+    req.on('error', e => { if (!settled) { settled = true; rej(e); } });
   });
+}
+
+// 请求体必须是 JSON 对象：字面量 null / 123 / "x" / [] 虽是合法 JSON，
+// 以前会让后续 body.prompt 之类读属性直接 TypeError，连接永远等不到响应
+async function readJsonBody(req) {
+  const v = JSON.parse((await readBody(req)) || '{}');
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('bad json: expected object');
+  return v;
 }
 
 // 长任务（Agent 跑工具时可能几分钟没有文本）必须有心跳，否则客户端按空闲超时断开
@@ -782,7 +875,9 @@ function authorized(req) {
   return h === 'Bearer ' + AUTH_TOKEN;
 }
 
-const server = http.createServer(async (req, res) => {
+// 安全网：handler 里任何漏网的异常都要收成一个响应，
+// 否则 async handler 一 reject 就只剩 unhandledRejection 日志，连接会一直挂到客户端超时
+async function handleRequest(req, res) {
   const u = new URL(req.url, 'http://x');
   const send = (code, obj) => {
     const s = JSON.stringify(obj);
@@ -942,8 +1037,8 @@ const server = http.createServer(async (req, res) => {
 
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: 'bad json' }); }
-    const rn = body.session || 'main';
+    try { body = await readJsonBody(req); } catch (e) { return send(400, { error: 'bad json' }); }
+    const rn = sessionName(body.session);
     const files = (Array.isArray(body.files) ? body.files : [body.file]).filter(Boolean).map(String);
     if (!files.length) return send(400, { error: 'no files' });
     const missing = files.filter(f => { try { return !fs.statSync(f).isFile(); } catch (e) { return true; } });
@@ -980,12 +1075,15 @@ const server = http.createServer(async (req, res) => {
   }
   if (u.pathname === '/battle' && req.method === 'POST') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
+    try { body = await readJsonBody(req); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
     const prompt = String(body.prompt || '').trim();
     if (!prompt) return send(400, { ok: false, error: 'empty prompt' });
-    const session = body.session || DEFAULT_SESSION;
+    const session = sessionName(body.session);
     const mode = body.mode === 'side' ? 'side' : 'battle';
     const models = Array.isArray(body.models) ? body.models.map(String).filter(Boolean).slice(0, 2) : [];
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableFinished) clientGone = true; });
+    const ctx = { aborted: () => clientGone };
     // 对战标签页独立于 agent/direct 的聊天页，用后缀区分，免得互相抢页面
     const key = session + '#battle';
     const opts = { mode, models, fresh: true };
@@ -997,8 +1095,8 @@ const server = http.createServer(async (req, res) => {
         const gap = Date.now() - (s.lastAsk || 0);
         if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
         s.lastAsk = Date.now();
-        const p = await askBattle(s, prompt);
-        battleRounds.set(session, { panes: p, mode, at: Date.now() });
+        const p = await askBattle(s, prompt, ctx);
+        setBattleRound(session, { panes: p, mode, at: Date.now() });
         return p;
       } finally {
         s.busy = false;
@@ -1011,13 +1109,14 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       minimizeChrome();
       log('battle error:', e.message);
+      if (e.aborted || clientGone) return send(499, { ok: false, error: 'client closed request' });
       return send(/NEED_VERIFY/.test(e.message) ? 409 : (e.busy ? 429 : 500), { ok: false, error: e.message });
     }
   }
   if (u.pathname === '/vote' && req.method === 'POST') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
-    const session = body.session || DEFAULT_SESSION;
+    try { body = await readJsonBody(req); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
+    const session = sessionName(body.session);
     const choice = String(body.choice || '').toLowerCase();
     if (!VOTE_RE[choice]) return send(400, { ok: false, error: 'choice must be a|b|tie|both' });
     const s = sessions.get(session + '#battle');
@@ -1026,21 +1125,27 @@ const server = http.createServer(async (req, res) => {
       const p = await enqueue(() => voteBattle(s.cdp, choice));
       const round = battleRounds.get(session);
       if (round) { round.voted = choice; round.revealed = p; }
+      // 投票可能已经点下去了、只是揭晓结果没读到：要说清楚，
+      // 不能读 p.a 时抛个 TypeError，让客户端以为投票失败再投一次
+      if (!p || !p.a || !p.b) return send(500, { ok: false, error: 'voted, but revealed panes could not be read' });
       return send(200, { ok: true, choice, a: p.a, b: p.b });
     } catch (e) {
-      return send(/NEED_VERIFY/.test(e.message) ? 409 : 500, { ok: false, error: e.message });
+      return send(/NEED_VERIFY/.test(e.message) ? 409 : (e.busy ? 429 : 500), { ok: false, error: e.message });
     }
   }
   if (u.pathname === '/new') {
     const name = u.searchParams.get('session') || DEFAULT_SESSION;
-    histories.delete(name); contextLost.delete(name);
-    const s = sessions.get(name);
-    if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(name); }
+    histories.delete(name); contextLost.delete(name); battleRounds.delete(name);
+    // battle 标签页是同一个会话名的另一张页，只关主会话的话「新会话」之后还能对旧对战投票
+    for (const key of [name, name + '#battle']) {
+      const s = sessions.get(key);
+      if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(key); }
+    }
     return send(200, { ok: true });
   }
   if ((u.pathname === '/v1/chat/completions' || u.pathname === '/chat/completions') && req.method === 'POST') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: { message: 'bad json', type: 'invalid_request_error' } }); }
+    try { body = await readJsonBody(req); } catch (e) { return send(400, { error: { message: 'bad json', type: 'invalid_request_error' } }); }
 const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x && typeof x === 'object' ? String(x.text || x.content || '') : String(x || '')).join('') : (c == null ? '' : String(c));
     const msgs = Array.isArray(body.messages) ? body.messages : [];
     const sys = msgs.filter(m => m && m.role === 'system').map(m => ctext(m.content)).join('\n\n');
@@ -1048,15 +1153,20 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     const prior = msgs.filter(m => m && m.role !== 'system' && m.content);
     if (!prior.length) return send(400, { error: { message: 'no user message', type: 'invalid_request_error' } });
     const last = ctext(prior[prior.length - 1].content);
-    const name = body.user || body.session || 'main';
+    const name = sessionName(body.user || body.session);
     const bodyPrior = prior.length > 1 ? prior.slice(0, -1) : null;
     const srvPrior = histories.get(name) || [];
+    const target = resolveV1Target(body);
+    const existing = sessions.get(name);
+    // 切模式/换模型会重开标签页（见 getSession），这一轮就要按「新标签页」回放历史
+    const targetChanged = !!existing && target.mode !== 'battle' && target.mode !== 'side'
+      && (existing.mode !== target.mode || (target.model && existing.model !== target.model));
     const fresh = body.arena_new === true || body.arena_continue === false;
     // 标签页重建过（LRU 淘汰 / 出错重置）时页面自己没上下文，得把服务端历史补回去，
     // 否则用户在对话中途会遇到「它怎么忘了刚才说的」这种无声失忆
     // 进程刚起、标签页被 LRU 淘汰或重建过时，页面里没有上下文；
     // 只有这种情况才需要把客户端带来的历史回放进去。
-    const needReplay = fresh || contextLost.has(name) || !sessions.has(name);
+    const needReplay = fresh || targetChanged || contextLost.has(name) || !sessions.has(name);
     // 新会话（fresh）没有客户端历史时，绝不能用服务端历史回填：那是上一个会话
     // 的内容，塞进新标签页会让模型把旧对话当成当前上下文，看起来就是「串台」。
     const useHist = needReplay
@@ -1065,8 +1175,14 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     if (needReplay && !useHist) log('replay skipped, no history for ' + name);
     let prompt = last;
     if (useHist) {
-      const hist = useHist.map(m => (m.role === 'assistant' ? '助手' : '用户') + '：' + ctext(m.content)).join('\n\n');
-      prompt = '以下是本次对话之前的记录，请接着最后一条继续回答，不要复述历史。\n\n【对话记录】\n' + hist + '\n\n【当前问题】\n' + last;
+      let hist = useHist.map(m => (m.role === 'assistant' ? '助手' : '用户') + '：' + ctext(m.content)).join('\n\n');
+      const head = '以下是本次对话之前的记录，请接着最后一条继续回答，不要复述历史。\n\n【对话记录】\n';
+      const tail = '\n\n【当前问题】\n' + last;
+      // 截断只能砍历史的头部。以前整串交给 typePrompt 从尾部 slice，
+      // 历史一长先消失的正好是末尾的【当前问题】，模型只能对着旧记录答非所问
+      const budget = MAX_PROMPT_CHARS - head.length - tail.length;
+      if (budget > 0 && hist.length > budget) hist = '…（更早的记录已省略）\n\n' + hist.slice(hist.length - Math.max(0, budget - 14));
+      prompt = budget > 0 ? head + hist + tail : last;
     }
     const dropSys = String(req.headers['x-arena-drop-system'] || '') === '1';
     // Arena 自带系统提示词，客户端的一律不转发
@@ -1088,7 +1204,8 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       log('PROMPT len=' + prompt.length);
     }
     const truncated = prompt.length > MAX_PROMPT_CHARS;
-    const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', models: (function (m) { if (Array.isArray(m)) return m.map(String).filter(Boolean).slice(0, 2); if (typeof m === 'string' && m) return m.split(',').map(function (x) { return x.trim(); }).filter(Boolean).slice(0, 2); return []; })(body.metadata && body.metadata.models), fresh };
+    const opts = { model: target.model, mode: target.mode, models: target.models, fresh };
+    log('v1 session=' + name + ' mode=' + opts.mode + ' model=' + (opts.model || body.model || '-') + ' stream=' + !!body.stream);
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
     const created = Math.floor(Date.now() / 1000);
@@ -1100,22 +1217,22 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     res.on('close', () => { if (!res.writableFinished) clientGone = true; });
     const ctx = { aborted: () => clientGone };
     let live = null;   // 本轮真正用的 session，出错时要靠它停生成/重置
+    let liveKey = name;   // battle 用的是 name#battle，重置时别误杀主会话
 
     const run = async () => {
       if (!(await ensureChrome())) throw new Error('chrome unavailable');
       // 常驻 battle/side 模式：普通提问也走并排，两栏答案合成一条消息
       if (opts.mode === 'battle' || opts.mode === 'side') {
         const key = name + '#battle';
-        if (!(await ensureChrome())) throw new Error('chrome unavailable');
         const s2 = await getSession(key, { mode: opts.mode, models: opts.models, fresh: true });
-        live = s2;
+        live = s2; liveKey = key;
         s2.busy = true;
         try {
           const gap = Date.now() - (s2.lastAsk || 0);
           if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
           s2.lastAsk = Date.now();
-          const p = await askBattle(s2, prompt);
-          battleRounds.set(name, { panes: p, mode: opts.mode, at: Date.now() });
+          const p = await askBattle(s2, prompt, ctx);
+          setBattleRound(name, { panes: p, mode: opts.mode, at: Date.now() });
           const text = '**A · ' + (p.a.label || 'A') + '**\n\n' + (p.a.text || '') + '\n\n---\n\n**B · ' + (p.b.label || 'B') + '**\n\n' + (p.b.text || '') + '\n\n投票：/vote a | b | tie | both';
           if (wantStream) chunk({ content: text });
           return { text };
@@ -1138,7 +1255,9 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         }) : null, ctx);
         s.lastAsk = Date.now();
         if (r && r.text) {
-          const h = histories.get(name) || [];
+          // fresh 是新会话：服务端历史也要从这一轮重新记，
+          // 否则下次标签页重建回放时，旧会话的内容会「复活」进新会话
+          const h = fresh ? [] : (histories.get(name) || []);
           h.push({ role: 'user', content: last });
           h.push({ role: 'assistant', content: r.text });
           if (h.length > 24) h.splice(0, h.length - 24);
@@ -1168,8 +1287,8 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         if (e.aborted || clientGone) {
           log('client gone, stopping generation');
         } else {
-          if (live) { try { await stopGeneration(live); } catch (e9) {} }
-          if (sessionBroken(e.message)) { try { await resetSession(name, e.message); } catch (e9) {} }
+          if (live) { try { await stopGeneration(live.cdp); } catch (e9) {} }
+          if (sessionBroken(e.message)) { try { await resetSession(liveKey, e.message); } catch (e9) {} }
           out('data: ' + JSON.stringify({ error: { message: e.message, type: 'upstream_error' } }) + '\n\n');
           out('data: [DONE]\n\n');
         }
@@ -1193,8 +1312,8 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       // 以前这条路径会把正在跑的那一轮连标签页一起关掉
       if (e.busy) return send(429, { error: { message: e.message, type: 'rate_limit_error' } });
       if (e.aborted || clientGone) return send(499, { error: { message: 'client closed request', type: 'aborted' } });
-      if (live) { try { await stopGeneration(live); } catch (e9) {} }
-      if (sessionBroken(e.message)) { try { await resetSession(name, e.message); } catch (e9) {} }
+      if (live) { try { await stopGeneration(live.cdp); } catch (e9) {} }
+      if (sessionBroken(e.message)) { try { await resetSession(liveKey, e.message); } catch (e9) {} }
       return send(500, { error: { message: e.message, type: 'upstream_error' } });
     }
   }
@@ -1203,10 +1322,10 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
   }
   if (u.pathname === '/ask' && req.method === 'POST') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: 'bad json' }); }
+    try { body = await readJsonBody(req); } catch (e) { return send(400, { error: 'bad json' }); }
     const prompt = String(body.prompt || '').trim();
     if (!prompt) return send(400, { error: 'empty prompt' });
-    const name = body.session || DEFAULT_SESSION;
+    const name = sessionName(body.session);
     const stream = !!body.stream;
     const truncated = prompt.length > MAX_PROMPT_CHARS;
     const opts = { model: body.model || '', mode: body.mode || 'agent', fresh: !!body.new };
@@ -1237,7 +1356,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     const fail = async (e) => {
       log('ask error:', e.message);
       if (e.aborted || clientGone) return;
-      if (live) { try { await stopGeneration(live); } catch (e9) {} }
+      if (live) { try { await stopGeneration(live.cdp); } catch (e9) {} }
       if (sessionBroken(e.message)) { try { await resetSession(name, e.message); } catch (e9) {} }
     };
 
@@ -1267,6 +1386,21 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     }
   }
   send(404, { error: 'not found' });
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(e => {
+    log('request handler error:', (e && e.stack) || e);
+    try {
+      if (!res.headersSent && !res.writableEnded) {
+        const s = JSON.stringify({ error: { message: 'internal error: ' + ((e && e.message) || e), type: 'internal_error' } });
+        res.writeHead(500, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(s) }, CORS_HEADERS));
+        res.end(s);
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    } catch (e9) { /* 客户端已断开 */ }
+  });
 });
 
 server.on('error', e => {

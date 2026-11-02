@@ -48,21 +48,37 @@ done
 
 command -v aichat >/dev/null 2>&1 || { echo "未找到 aichat，请先安装" >&2; exit 1; }
 
+AUTH=()
+[ -n "${ARB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $ARB_TOKEN")
+
+# /health 的 ok 表示「Chrome 已就绪」，不是「桥活着」：
+# 冷启动时桥会先回 ok:false 并在后台拉 Chrome，这时候进 REPL 是没问题的（首问会等它）
+bridge_up() { printf '%s' "$1" | grep -q '"version"'; }
+
 HEALTH=$(curl -s --max-time 2 http://127.0.0.1:17892/health 2>/dev/null)
-if ! printf '%s' "$HEALTH" | grep -q '"ok":true'; then
+if ! bridge_up "$HEALTH"; then
   echo "正在建立到电脑的隧道..." >&2
   if ! arena-tunnel >/dev/null 2>&1; then
     echo "隧道建立失败：确认电脑开机、arena-bridge 计划任务在跑" >&2
     exit 1
   fi
   HEALTH=$(curl -s --max-time 3 http://127.0.0.1:17892/health 2>/dev/null)
-  printf '%s' "$HEALTH" | grep -q '"ok":true' || {
+  bridge_up "$HEALTH" || {
     echo "桥接服务异常: ${HEALTH:-无响应}" >&2; exit 1; }
+fi
+if ! printf '%s' "$HEALTH" | grep -q '"chrome":true'; then
+  echo "桥接已连通，Chrome 正在启动，第一个问题可能要多等几十秒。" >&2
 fi
 
 if [ -n "$REPO" ]; then
   echo "切换仓库到 $REPO ..." >&2
-  curl -s --max-time 200 --get --data-urlencode "name=$REPO" "http://127.0.0.1:17892/repo"     | jq -r 'if .ok then "  已切到 \(.repo)" else "  失败: \(.error // "未知")" end' 2>/dev/null >&2
+  R=$(curl -s --max-time 200 "${AUTH[@]}" --get --data-urlencode "name=$REPO" "http://127.0.0.1:17892/repo")
+  if printf '%s' "$R" | grep -q '"ok":true'; then
+    echo "  已切到 $REPO" >&2
+  else
+    echo "  切换仓库失败: ${R:-无响应}" >&2
+    exit 1
+  fi
 fi
 
 if [ "$NOBANNER" != 1 ] && [ -t 1 ]; then

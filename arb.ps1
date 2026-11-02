@@ -14,7 +14,9 @@ try {
   if ($Model -ne '') { $body.model = $Model }
   if ($Fresh -eq '1') { $body.new = $true }
   $bytes = [Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Compress))
-  $r = Invoke-RestMethod -Uri $Url -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 1500
+  $headers = @{}
+  if ($env:ARB_TOKEN) { $headers['Authorization'] = 'Bearer ' + $env:ARB_TOKEN }
+  $r = Invoke-RestMethod -Uri $Url -Method Post -Body $bytes -Headers $headers -ContentType 'application/json; charset=utf-8' -TimeoutSec 1500
   $j = $r | ConvertTo-Json -Compress -Depth 6
   [IO.File]::WriteAllText($Out, $j, [Text.Encoding]::UTF8)
   'OK ' + (Get-Item $Out).Length

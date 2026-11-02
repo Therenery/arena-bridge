@@ -85,6 +85,12 @@ test('error 帧带上 agent 前缀', () => {
   assert.match(r.error, /quota/);
 });
 
+test('注入脚本真实产出的 error 帧（d 为空，原因在 m 里）不能丢原因', () => {
+  // 注入脚本对没有 delta 的 error record 只带 e/d=""/n/i，原因在 m
+  const r = parseFrame({ e: 'error', d: '', n: '', i: null, m: 'rate limited, retry later' });
+  assert.equal(r.error, 'agent: rate limited, retry later');
+});
+
 test('data: records 里的 text-delta 累积成事件', () => {
   const line = 'data: ' + JSON.stringify({
     records: [

@@ -75,7 +75,7 @@ arena doctor             # 隧道 / 桥接 / Chrome / 模型 体检
 |---|---|---|
 | `ARB_STATE_DIR` | `F:/__AI__/work` | 仓库缓存、调试转储的目录 |
 | `ARB_MAX_SESSIONS` | `6` | 常驻标签页上限，超了按最久未用淘汰 |
-| `ARB_UPLOAD_ROOTS` | 空（不限制） | `/upload` 允许外发的目录白名单，`;`（Windows）或 `:` 分隔 |
+| `ARB_UPLOAD_ROOTS` | `ARB_STATE_DIR` + 当前工作目录 | `/upload` 允许外发的目录白名单，`;`（Windows）或 `:` 分隔 |
 | `ARB_SSE_PING_MS` | `15000` | SSE 心跳间隔，防长任务被客户端判空闲 |
 | `ARB_DEBUG_PROMPT` | 关 | 设为 `1` 才把 prompt 正文写日志/落盘 |
 | `ARB_TOKEN` | 空（不校验） | 非空时所有接口（除 `/health`）要求 `Authorization: Bearer <token>` |

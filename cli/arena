@@ -37,6 +37,9 @@ arena —— 把 arena.ai 的 Agent 接进本地工作流
 EOF
 }
 
+AUTH=()
+[ -n "${ARB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $ARB_TOKEN")
+
 case "${1:-}" in
   ""|tui|--tui)
     [ $# -gt 0 ] && shift
@@ -67,8 +70,9 @@ case "${1:-}" in
     shift
     S=${1:-main}
     curl -s --max-time 2 http://127.0.0.1:17892/health >/dev/null 2>&1 || arena-tunnel >/dev/null 2>&1
-    if ! curl -s --max-time 10 "http://127.0.0.1:17892/new?session=$S" >/dev/null 2>&1; then
-      echo "清理失败：隧道或桥接不可用" >&2; exit 1
+    R=$(curl -s --max-time 10 "${AUTH[@]}" --get --data-urlencode "session=$S" "http://127.0.0.1:17892/new" 2>/dev/null)
+    if ! printf '%s' "$R" | grep -q '"ok":true'; then
+      echo "清理失败：${R:-隧道或桥接不可用}" >&2; exit 1
     fi
     rm -f "$HOME/.config/aichat/sessions/$S.yaml"
     echo "已清空会话 $S"
@@ -76,7 +80,7 @@ case "${1:-}" in
   repos|--repos)
     shift
     curl -s --max-time 2 http://127.0.0.1:17892/health >/dev/null 2>&1 || arena-tunnel >/dev/null 2>&1
-    R=$(curl -s --max-time 150 "http://127.0.0.1:17892/repos")
+    R=$(curl -s --max-time 150 "${AUTH[@]}" "http://127.0.0.1:17892/repos")
     echo "$R" | jq -r 'if .repos then "当前: \(.repo)\n" + (.repos | join("\n")) else "失败: \(.error // "未知")" end' 2>/dev/null || echo "$R"
     ;;
   repo|--repo)
@@ -84,7 +88,7 @@ case "${1:-}" in
     W=${1:-}
     if [ -z "$W" ]; then echo "用法: arena repo <owner/name>" >&2; exit 2; fi
     curl -s --max-time 2 http://127.0.0.1:17892/health >/dev/null 2>&1 || arena-tunnel >/dev/null 2>&1
-    R=$(curl -s --max-time 200 --get --data-urlencode "name=$W" "http://127.0.0.1:17892/repo")
+    R=$(curl -s --max-time 200 "${AUTH[@]}" --get --data-urlencode "name=$W" "http://127.0.0.1:17892/repo")
     echo "$R" | jq -r 'if .ok then "已切到 \(.repo)，新对话已开" else "失败: \(.error // "未知")" end' 2>/dev/null || echo "$R"
     ;;
   doctor)

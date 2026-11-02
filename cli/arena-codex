@@ -15,15 +15,23 @@ if ! curl -s --max-time 2 http://127.0.0.1:17893/health >/dev/null 2>&1; then
     echo "  也可用 ARENA_RESPONSES_BIN 指向已有实现。" >&2
     exit 1
   fi
+  command -v tmux >/dev/null 2>&1 || { echo "未找到 tmux，无法在后台拉起 Responses 适配器" >&2; exit 1; }
   tmux kill-session -t arbresp 2>/dev/null
   tmux new-session -d -s arbresp "node $RESP_BIN 2>&1 | tee /tmp/arena-responses.log"
+  RESP_UP=0
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.5
-    curl -s --max-time 1 http://127.0.0.1:17893/health >/dev/null 2>&1 && break
+    if curl -s --max-time 1 http://127.0.0.1:17893/health >/dev/null 2>&1; then RESP_UP=1; break; fi
   done
+  # 适配器没起来还硬进 Codex，用户只能在 TUI 里看到一串连接错误
+  if [ "$RESP_UP" != 1 ]; then
+    echo "Responses 适配器没有起来（17893 无响应）。最近日志：" >&2
+    tail -n 20 /tmp/arena-responses.log 2>/dev/null | sed 's/^/  /' >&2
+    exit 1
+  fi
 fi
 
-export ARENA_API_KEY="sk-arena-local"
+export ARENA_API_KEY="${ARENA_API_KEY:-${ARB_TOKEN:-sk-arena-local}}"
 export RUST_LOG="${RUST_LOG:-error}"
 
 exec "${CODEX_BIN:-/root/.local/codex/codex}" --no-daemon "$@"

@@ -382,7 +382,7 @@ const HISTORY_JS = String.raw`(async function(){
     try { var r = await fetch(location.href, {credentials:'include'}); return await r.text(); } catch (e) { return h; }
   }
   var html = (await pageHtml()).replace(/\\"/g, '"');
-  var m = html.match(/"pagination":\{"hasMore":(true|false),"cursor":(null|"[^"]+)"/);
+  var m = html.match(/"pagination":\{"hasMore":(true|false),"cursor":(null|"[^"]+")/);
   if (!m) return JSON.stringify({ok:true, messages:out, via:'dom-only', url:location.href, turns:out.length});
   var hasMore = m[1] === 'true';
   var cursor = m[2] === 'null' ? null : m[2].slice(1, -1);
@@ -391,11 +391,15 @@ const HISTORY_JS = String.raw`(async function(){
   var id = location.pathname.split('/').filter(Boolean).pop();
   var older = [];
   var pages = 0;
+  var lastErr = '';
   while (cursor && pages < 20) {
-    var resp = await fetch('/api/chat/' + id + '/messages?cursor=' + encodeURIComponent(cursor), {credentials:'include'});
-    if (!resp.ok) break;
+    var resp = null;
+    try {
+      resp = await fetch('/api/chat/' + id + '/messages?cursor=' + encodeURIComponent(cursor), {credentials:'include'});
+    } catch (e) { lastErr = 'fetch: ' + e.message; break; }
+    if (!resp.ok) { lastErr = 'http ' + resp.status; break; }
     var j = null;
-    try { j = await resp.json(); } catch (e) { break; }
+    try { j = await resp.json(); } catch (e) { lastErr = 'json'; break; }
     var msgs = (j && j.messages) || [];
     var block = [];
     msgs.forEach(function(mm){
@@ -412,7 +416,7 @@ const HISTORY_JS = String.raw`(async function(){
     cursor = (pg.hasMore && pg.cursor) ? pg.cursor : null;
   }
   var all = older.concat(out);
-  return JSON.stringify({ok:true, messages:all, via: pages ? 'api-paged' : 'role-attrs', url:location.href, turns:all.length, pages:pages});
+  return JSON.stringify({ok:true, messages:all, via: pages ? 'api-paged' : 'role-attrs', url:location.href, turns:all.length, pages:pages, err:lastErr});
 })()`;
 const RESUME_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /close review/i.test(x.getAttribute('aria-label')||'')})[0];if(cs){cs.click();return 2}var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /^\\s*(关闭|Close)\\s*$/i.test((x.getAttribute('aria-label')||''))})[0];if(b){b.click();return 1}return 0})()";
 const REVIEW_JS = "(()=>{try{var t=(document.body&&document.body.innerText)||'';return t.indexOf('此任务成功了吗')>=0||t.indexOf('Did this task succeed')>=0}catch(e){return false}})()";

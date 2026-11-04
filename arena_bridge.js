@@ -10,7 +10,7 @@ const path = require('path');
 const { exec, spawn } = require('child_process');
 const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -71,6 +71,24 @@ async function realClick(c, p) {
 }
 const CHIP_POS_JS = "(function(){var b=[].slice.call(document.querySelectorAll('button')).filter(function(x){var t=(x.innerText||'').trim();return t.length>2&&t.length<60&&t.indexOf('/')>0&&t.indexOf(' ')<0})[0];if(!b)return '';var r=b.getBoundingClientRect();if(!r.width)return '';return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()";
 const ADD_BTN_POS_JS = "(function(){var es=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /Add files and connections/i.test(x.getAttribute('aria-label')||'')});for(var i=0;i<es.length;i++){var r=es[i].getBoundingClientRect();if(r.width>0&&r.height>0)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})}return ''})()";
+// 文件框还没进 DOM 时，点一下「Add files and connections」把它逼出来。
+// 点之前先拦下文件选择框：不然 Windows 原生对话框会弹出来卡在那儿，人也看得见。
+async function clickAttach(c) {
+  let chooser = null;
+  c.onEvent = m => { if (m.method === 'Page.fileChooserOpened') chooser = m.params; };
+  await c.send('Page.setInterceptFileChooserDialog', { enabled: true }).catch(() => {});
+  const pos = await c.ev(ADD_BTN_POS_JS).catch(() => '');
+  if (pos) await realClick(c, JSON.parse(pos)).catch(() => {});
+  for (let i = 0; i < 10 && !chooser; i++) await sleep(300);
+  await c.send('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+  c.onEvent = null;
+  // 点出来的是菜单而不是文件框：按 Esc 收掉，页面上不留痕迹
+  if (!chooser) {
+    await c.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+    await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+  }
+  return chooser;
+}
 const SEL_TAB_POS_JS = "(function(){function inOpen(e){var p=e;for(var i=0;i<8&&p;i++){var st=p.getAttribute&&p.getAttribute('data-state');if(st==='open')return true;p=p.parentElement}return false}var els=[].slice.call(document.querySelectorAll('span,button,div'));for(var i=els.length-1;i>=0;i--){var e=els[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='Select a repository')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;if(!inOpen(e))continue;var px=Math.round(r.left+r.width/2),py=Math.round(r.top+r.height/2);var h=document.elementFromPoint(px,py);for(var k=0;k<4&&h;k++){if((h.innerText||'').trim()==='Select a repository')return JSON.stringify({x:px,y:py});h=h.parentElement}}return ''})()";
 const OUTER_GH_POS_JS = "(function(){var best=null;[].slice.call(document.querySelectorAll('span,button,div')).forEach(function(e){if(e.children.length>1)return;if((e.innerText||'').trim()!=='GitHub')return;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)return;var q=e,st='';for(var i=0;i<8&&q;i++){var s=q.getAttribute&&q.getAttribute('data-state');if(s){st=s;break}q=q.parentElement}if(st==='open')return;var px=Math.round(r.left+r.width/2),py=Math.round(r.top+r.height/2);var h=document.elementFromPoint(px,py);for(var k=0;k<4&&h;k++){if((h.innerText||'').trim()==='GitHub'){best={x:px,y:py};return}h=h.parentElement}});return best?JSON.stringify(best):''})()";
 const GH_ITEM_POS_JS = "(function(){function inOpen(e){var p=e;for(var i=0;i<8&&p;i++){var st=p.getAttribute&&p.getAttribute('data-state');if(st==='open')return true;p=p.parentElement}return false}var els=[].slice.call(document.querySelectorAll('span,button,div'));var anchor=null;for(var i=0;i<els.length;i++){var e=els[i];if(e.children.length>1)continue;if((e.innerText||'').trim()!=='Connectors')continue;var r=e.getBoundingClientRect();if(r.width<4||r.height<4)continue;if(!inOpen(e))continue;anchor=r;break}if(!anchor)return '';for(var j=0;j<els.length;j++){var x=els[j];if(x.children.length>1)continue;if((x.innerText||'').trim()!=='GitHub')continue;var q=x.getBoundingClientRect();if(q.width<4||q.height<4)continue;if(Math.abs(q.top-anchor.top)>12)continue;var px=Math.round(q.left+q.width/2),py=Math.round(q.top+q.height/2);var h=document.elementFromPoint(px,py);for(var k=0;k<4&&h;k++){if((h.innerText||'').trim()==='GitHub')return JSON.stringify({x:px,y:py});h=h.parentElement}break}return ''})()";
@@ -97,12 +115,15 @@ function cdpApi(method, path) {
 class CDP {
   constructor(ws) {
     this.ws = ws; this.id = 0; this.pending = new Map(); this.closed = false;
+    this.onEvent = null; // 事件回调（Page.fileChooserOpened 这类没有 id 的推送）
     ws.onmessage = e => {
       let m; try { m = JSON.parse(e.data); } catch { return; }
       if (m.id && this.pending.has(m.id)) {
         const p = this.pending.get(m.id); this.pending.delete(m.id);
         m.error ? p.rej(new Error(m.error.message)) : p.res(m.result);
+        return;
       }
+      if (m.method && this.onEvent) { try { this.onEvent(m); } catch (err) {} }
     };
     ws.onclose = () => { this.closed = true; for (const [, p] of this.pending) p.rej(new Error('ws closed')); this.pending.clear(); };
   }
@@ -451,7 +472,7 @@ async function waitReady(c, maxMs) {
   const t0 = Date.now();
   const lim = maxMs || READY_TIMEOUT_MS;
   while (Date.now() - t0 < lim) {
-    if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+    if (await c.ev(VERIFY_JS)) throw needVerify(c);
     if (await c.ev(READY_JS)) { await sleep(600); return; }
     if (await c.ev(REVIEW_JS)) {
       await dismissReview(c);
@@ -514,6 +535,26 @@ function minimizeChrome() {
   if (now - lastMinAt < 1200) return;
   lastMinAt = now;
   try { exec(cmd, () => {}); } catch (e) {}
+}
+
+let lastRestoreAt = 0;
+// 撞上人机验证时得让人看得见页面：先把标签页激活，再让窗口从最小化里出来。
+// Windows 上桥常驻在 session 0，够不到 session 1 的窗口，所以默认走计划任务。
+function restoreChrome() {
+  const now = Date.now();
+  if (now - lastRestoreAt < 3000) return;
+  lastRestoreAt = now;
+  const cmd = process.env.ARB_RESTORE_CMD || (process.platform === 'win32' ? 'schtasks /run /tn arena_restore' : '');
+  if (!cmd) return;
+  log('restoring chrome window for verification');
+  try { exec(cmd, () => {}); } catch (e) {}
+}
+
+// 所有 NEED_VERIFY 的抛出点都走这里：先叫人，再报错
+function needVerify(c) {
+  restoreChrome();
+  if (c && c.send) c.send('Page.bringToFront').catch(() => {});
+  return new Error('NEED_VERIFY');
 }
 
 async function openTab(model, mode, models, navUrl) {
@@ -750,7 +791,7 @@ async function getSession(name, opts) {
 async function askOnce(s, prompt, onDelta, ctx) {
   const c = s.cdp;
   const aborted = () => !!(ctx && ctx.aborted && ctx.aborted());
-  if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+  if (await c.ev(VERIFY_JS)) throw needVerify(c);
   if (!(await c.ev(READY_JS))) { await waitReady(c); }
   if (await isGenerating(c)) {
     log('previous turn still generating, stopping it first');
@@ -793,7 +834,7 @@ async function askOnce(s, prompt, onDelta, ctx) {
     const cand = now.filter(x => /create-evaluation|create-chat|realtime|ai-proxy/.test(x.u) && (x.t >= sendTs - 1500 || pre.has(x.id)));
     if (++tick % 30 === 0) log('poll', JSON.stringify({ cur: [...cursors], len: text.length, streams: now.length, done }));
     if (!cand.length) {
-      if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+      if (await c.ev(VERIFY_JS)) throw needVerify(c);
       if (Date.now() - lastSendAt > 10000 && sendRetries < 2) {
         const left = await c.ev(VAL_JS);
         if (left <= 1) {
@@ -860,7 +901,7 @@ const paneReady = (t) => !!t && !NOT_READY_RE.test(String(t).trim());
 
 async function askBattle(s, prompt) {
   const c = s.cdp;
-  if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+  if (await c.ev(VERIFY_JS)) throw needVerify(c);
   if (!(await c.ev(READY_JS))) await waitReady(c);
   for (let i = 0; i < 24; i++) { if (await c.ev(MODELS_READY_JS).catch(() => false)) break; await sleep(500); }
   await sleep(600);
@@ -871,7 +912,7 @@ async function askBattle(s, prompt) {
   while (Date.now() - t0 < ASK_MAX_MS) {
     await sleep(POLL_MS);
     if (c.closed) throw new Error('tab closed');
-    if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
+    if (await c.ev(VERIFY_JS)) throw needVerify(c);
     const p = await readBattlePanes(c);
     if (p && paneReady(p.a.text) && paneReady(p.b.text)) {
       if (await c.ev(VOTE_READY_JS)) return p;
@@ -1128,10 +1169,27 @@ const server = http.createServer(async (req, res) => {
       if (!(await ensureChrome())) throw chromeDownError();
       const s = await getSession(rn, { mode: 'agent' });
       await waitReady(s.cdp);
-      const obj = await s.cdp.send('Runtime.evaluate', { expression: "document.querySelector('input[type=file]')", objectGroup: 'arena-upload' });
-      const objectId = obj && obj.result && obj.result.objectId;
-      if (!objectId) throw new Error('no file input on page');
-      await s.cdp.send('DOM.setFileInputFiles', { files, objectId });
+      // composer 挂上之后文件框还要再晚一拍才进 DOM，先等它；等不到就点附件按钮逼它出来
+      let objectId = '', backendNodeId = 0;
+      for (let i = 0; i < 20; i++) {
+        const obj = await s.cdp.send('Runtime.evaluate', {
+          expression: "document.querySelector('input[type=file]')",
+          objectGroup: 'arena-upload',
+        }).catch(() => null);
+        objectId = (obj && obj.result && obj.result.objectId) || '';
+        if (objectId) break;
+        if (i === 4) {
+          const fc = await clickAttach(s.cdp);
+          if (fc && fc.backendNodeId) { backendNodeId = fc.backendNodeId; break; }
+        }
+        await sleep(400);
+      }
+      if (objectId) await s.cdp.send('DOM.setFileInputFiles', { files, objectId });
+      else if (backendNodeId) await s.cdp.send('DOM.setFileInputFiles', { files, backendNodeId });
+      else {
+        await s.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'arena-upload' }).catch(() => {});
+        throw new Error('no file input on page');
+      }
       // 用完就放，别让文件节点在页面里挂一整轮
       await s.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'arena-upload' }).catch(() => {});
       await sleep(1500);
@@ -1146,7 +1204,7 @@ const server = http.createServer(async (req, res) => {
       return { ok: true, attached: seen, files: names };
     };
     // 同样走队列：上传要往输入框里塞文件，和正在生成的回答抢页面必然打架
-    return enqueue(doUp).then(r => send(200, r)).catch(e => send(e && e.busy ? 429 : 500, { error: e.message }));
+    return enqueue(doUp).then(r => send(200, r)).catch(e => send(/NEED_VERIFY/.test(e.message) ? 409 : (e && e.busy ? 429 : 500), { error: e.message }));
   }
   if (u.pathname === '/battle' && req.method === 'POST') {
     let body;
@@ -1215,7 +1273,7 @@ const server = http.createServer(async (req, res) => {
     const name = u.searchParams.get('session') || DEFAULT_SESSION;
     try {
       const s = await getSession(name, { mode: 'agent' });
-      if (await s.cdp.ev(VERIFY_JS)) return send(409, { ok: false, error: 'NEED_VERIFY' });
+      if (await s.cdp.ev(VERIFY_JS)) return send(409, { ok: false, error: needVerify(s.cdp).message });
       const data = await s.cdp.evJson(CONVERSATIONS_JS);
       if (!data || !data.ok) return send(500, { ok: false, error: '页面里没读到会话列表' });
       return send(200, data);

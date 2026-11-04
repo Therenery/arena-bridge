@@ -7,10 +7,10 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -23,7 +23,7 @@ const MAX_QUEUE = 4;
 
 /* ---------- 可配置项（全部有默认值，不设也能跑） ---------- */
 // 状态目录：仓库缓存、调试转储都落在这里
-const STATE_DIR = process.env.ARB_STATE_DIR || 'F:/__AI__/work';
+const STATE_DIR = process.env.ARB_STATE_DIR || path.join(require('os').homedir(), '.arena-bridge');
 // 常驻标签页上限，超过就按最久未用淘汰，避免标签堆积
 const MAX_SESSIONS = Math.max(1, Number(process.env.ARB_MAX_SESSIONS) || 6);
 // 默认不打印 prompt 正文，也不落盘；排障时再开
@@ -222,13 +222,100 @@ const INJECT = String.raw`
 `;
 
 /* ---------- browser ---------- */
+// 浏览器不随本项目分发：用用户自己装的 Chrome（Edge / Chromium 也行）
+const CHROME_PROFILE = process.env.ARB_PROFILE || path.join(STATE_DIR, 'chrome-profile');
+let chromeHint = '';
+
+function whichSync(bin) {
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', ''] : [''];
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const p = path.join(dir, bin + ext);
+      try { if (fs.existsSync(p)) return p; } catch (e) {}
+    }
+  }
+  return '';
+}
+
+// 找浏览器：ARB_CHROME 显式指定 > 各平台常见安装路径 > PATH
+function findChrome() {
+  if (process.env.ARB_CHROME) return process.env.ARB_CHROME;
+  const cands = [];
+  if (process.platform === 'win32') {
+    const pf = process.env.ProgramFiles || 'C:\\Program Files';
+    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const local = process.env.LOCALAPPDATA || '';
+    cands.push(
+      path.join(pf, 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(pf86, 'Google\\Chrome\\Application\\chrome.exe'),
+      local ? path.join(local, 'Google\\Chrome\\Application\\chrome.exe') : '',
+      path.join(pf, 'Microsoft\\Edge\\Application\\msedge.exe'),
+      path.join(pf86, 'Microsoft\\Edge\\Application\\msedge.exe'),
+      local ? path.join(local, 'Microsoft\\Edge\\Application\\msedge.exe') : '',
+    );
+  } else if (process.platform === 'darwin') {
+    cands.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    );
+  } else {
+    for (const n of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'microsoft-edge']) {
+      const p = whichSync(n);
+      if (p) cands.push(p);
+    }
+  }
+  for (const c of cands) if (c && fs.existsSync(c)) return c;
+  return '';
+}
+
+// 起浏览器。默认自己 spawn；SSH / 计划任务这类必须换会话启动的场景，用 ARB_CHROME_CMD 覆盖
+function launchChrome() {
+  const custom = process.env.ARB_CHROME_CMD || '';
+  if (custom) {
+    log('launching chrome by ARB_CHROME_CMD');
+    try { exec(custom, () => {}); } catch (e) { log('launch err', e.message); }
+    return true;
+  }
+  const bin = findChrome();
+  if (!bin) {
+    chromeHint = '没找到 Chrome：装一个 Chrome/Edge，或用 ARB_CHROME 指定可执行文件路径';
+    log(chromeHint);
+    return false;
+  }
+  try { fs.mkdirSync(CHROME_PROFILE, { recursive: true }); } catch (e) {}
+  log('launching chrome', bin);
+  try {
+    const child = spawn(bin, [
+      '--remote-debugging-port=' + CDP_PORT,
+      '--user-data-dir=' + CHROME_PROFILE,
+      '--no-first-run',
+      '--no-default-browser-check',
+    ], { detached: true, stdio: 'ignore' });
+    child.on('error', (e) => log('chrome spawn err', e.message));
+    child.unref();
+  } catch (e) {
+    chromeHint = 'Chrome 起不来：' + e.message;
+    log(chromeHint);
+    return false;
+  }
+  return true;
+}
+
+// 起不来时给一句人话，别只扔 chrome unavailable
+function chromeDownError() {
+  const why = chromeHint || '浏览器没响应 9222 端口，看看 Chrome 是不是被关掉了';
+  return new Error('chrome unavailable：' + why);
+}
+
 let chromeLaunching = false;
 async function ensureChrome() {
   try { await cdpApi('GET', '/json/version'); return true; } catch (e) {}
   if (chromeLaunching) { for (let i = 0; i < 40; i++) { await sleep(1500); try { await cdpApi('GET', '/json/version'); return true; } catch (e) {} } return false; }
   chromeLaunching = true;
   log('chrome down, launching');
-  try { exec('schtasks /run /tn chrome-arena', () => {}); } catch (e) { log('launch err', e.message); }
+  if (!launchChrome()) { chromeLaunching = false; return false; }
   for (let i = 0; i < 40; i++) { await sleep(1500); try { await cdpApi('GET', '/json/version'); chromeLaunching = false; log('chrome up'); return true; } catch (e) {} }
   chromeLaunching = false; log('chrome launch timeout'); return false;
 }
@@ -238,6 +325,95 @@ const EDITOR_SEL = `document.querySelector('textarea[name=message]')||document.q
 const READY_JS = `!!(${EDITOR_SEL})`;
 const VAL_JS = `(function(){var e=${EDITOR_SEL};if(!e)return 0;var v=(e.value!==undefined?e.value:(e.innerText||''));return String(v).replace(/[\s\u00a0\u200b]/g,'').length})()`;
 
+
+// 左侧栏的会话列表：每个会话是一个指向 /agent/<uuid> 或 /c/<uuid> 的链接
+const CONVERSATIONS_JS = String.raw`JSON.stringify((function(){
+  var out=[], seen={};
+  var as=[].slice.call(document.querySelectorAll('a[href]'));
+  as.forEach(function(a){
+    var h=a.getAttribute('href')||'';
+    var m=h.match(/^\/(agent|c)\/([0-9a-f-]{8,})/i);
+    if(!m||seen[h]) return;
+    seen[h]=1;
+    var t=String(a.innerText||'').replace(/\u00a0/g,' ').trim().split('\n')[0].trim();
+    out.push({id:m[2], url:h, kind:m[1], title:t.slice(0,120)});
+  });
+  return {ok:true, conversations:out.slice(0,60), url:location.href};
+})())`;
+
+// 从当前页面读对话。Agent 页有明确的角色属性；/c/ 页只有气泡样式，按气泡对齐猜。
+//
+// Arena 的 agent 会话在 DOM 里只挂最新的一轮（transcriptReadStrategy=bounded），
+// 更早的消息要靠 /api/chat/<id>/messages?cursor=... 一页页往回翻。游标藏在页面的
+// RSC 负载里（"pagination":{"hasMore":..,"cursor":".."}），所以这里先从 DOM 取
+// 最新一轮，再从负载里取游标往回翻，最后拼成完整历史。
+const HISTORY_JS = String.raw`(async function(){
+  function clean(t){ return String(t||'').replace(/\u00a0/g,' ').trim(); }
+  function fromParts(m){
+    var ps = Array.isArray(m && m.parts) ? m.parts : [];
+    var t = ps.filter(function(p){ return p && p.type === 'text' && p.text; }).map(function(p){ return p.text; }).join('\n\n');
+    return clean(t);
+  }
+  var out = [];
+  var seen = {};
+  var turns = [].slice.call(document.querySelectorAll('[data-agent-transcript-message="true"]'));
+  turns.forEach(function(t){
+    var mid = t.getAttribute('data-chat-message-id') || '';
+    if (mid) seen[mid] = 1;
+    var u = t.querySelector('[data-user-message-body-row="true"]');
+    if (u) { var ut = clean(u.innerText); if (ut) out.push({role:'user', text:ut}); }
+    var ps = [].slice.call(t.querySelectorAll('.prose')).filter(function(p){ return !p.closest('[data-user-message-body-row="true"]'); });
+    var at = ps.map(function(p){ return clean(p.innerText); }).filter(Boolean).join('\n\n');
+    if (at) out.push({role:'assistant', text:at});
+  });
+  if (!turns.length) {
+    var ps2 = [].slice.call(document.querySelectorAll('.prose')).map(function(p){
+      var r = p.getBoundingClientRect();
+      return {p:p, y:r.top, x:r.left, text:clean(p.innerText)};
+    }).filter(function(o){ return o.text; });
+    ps2.sort(function(a,b){ return a.y - b.y || a.x - b.x; });
+    ps2.forEach(function(o){ out.push({role: o.p.closest('[class*="bg-surface-raised"]') ? 'user' : 'assistant', text:o.text}); });
+    if (!out.length) return JSON.stringify({ok:false, error:'页面里没读到对话'});
+  }
+
+  async function pageHtml(){
+    var h = document.documentElement.outerHTML || '';
+    if (h.indexOf('hasMore') >= 0) return h;
+    try { var r = await fetch(location.href, {credentials:'include'}); return await r.text(); } catch (e) { return h; }
+  }
+  var html = (await pageHtml()).replace(/\\"/g, '"');
+  var m = html.match(/"pagination":\{"hasMore":(true|false),"cursor":(null|"[^"]+)"/);
+  if (!m) return JSON.stringify({ok:true, messages:out, via:'dom-only', url:location.href, turns:out.length});
+  var hasMore = m[1] === 'true';
+  var cursor = m[2] === 'null' ? null : m[2].slice(1, -1);
+  if (!hasMore || !cursor) return JSON.stringify({ok:true, messages:out, via:'role-attrs', url:location.href, turns:out.length});
+
+  var id = location.pathname.split('/').filter(Boolean).pop();
+  var older = [];
+  var pages = 0;
+  while (cursor && pages < 20) {
+    var resp = await fetch('/api/chat/' + id + '/messages?cursor=' + encodeURIComponent(cursor), {credentials:'include'});
+    if (!resp.ok) break;
+    var j = null;
+    try { j = await resp.json(); } catch (e) { break; }
+    var msgs = (j && j.messages) || [];
+    var block = [];
+    msgs.forEach(function(mm){
+      var mid = mm.id || '';
+      if (mid && seen[mid]) return;
+      var text = fromParts(mm);
+      if (!text) return;
+      if (mid) seen[mid] = 1;
+      block.push({role: mm.role === 'user' ? 'user' : 'assistant', text: text});
+    });
+    older = block.concat(older);
+    pages++;
+    var pg = (j && j.pagination) || {};
+    cursor = (pg.hasMore && pg.cursor) ? pg.cursor : null;
+  }
+  var all = older.concat(out);
+  return JSON.stringify({ok:true, messages:all, via: pages ? 'api-paged' : 'role-attrs', url:location.href, turns:all.length, pages:pages});
+})()`;
 const RESUME_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('[aria-label]')).filter(function(x){return /close review/i.test(x.getAttribute('aria-label')||'')})[0];if(cs){cs.click();return 2}var bs=[].slice.call(document.querySelectorAll('button'));var b=bs.filter(function(x){return /^\\s*(关闭|Close)\\s*$/i.test((x.getAttribute('aria-label')||''))})[0];if(b){b.click();return 1}return 0})()";
 const REVIEW_JS = "(()=>{try{var t=(document.body&&document.body.innerText)||'';return t.indexOf('此任务成功了吗')>=0||t.indexOf('Did this task succeed')>=0}catch(e){return false}})()";
 
@@ -267,9 +443,10 @@ function dismissReviewSoon(c) {
   })().catch(() => {});
 }
 
-async function waitReady(c) {
+async function waitReady(c, maxMs) {
   const t0 = Date.now();
-  while (Date.now() - t0 < READY_TIMEOUT_MS) {
+  const lim = maxMs || READY_TIMEOUT_MS;
+  while (Date.now() - t0 < lim) {
     if (await c.ev(VERIFY_JS)) throw new Error('NEED_VERIFY');
     if (await c.ev(READY_JS)) { await sleep(600); return; }
     if (await c.ev(REVIEW_JS)) {
@@ -325,14 +502,17 @@ async function adoptTab(base) {
 }
 
 let lastMinAt = 0;
+// 可选：让窗口缩到后台。不配 ARB_MINIMIZE_CMD 就什么都不做
 function minimizeChrome() {
+  const cmd = process.env.ARB_MINIMIZE_CMD || '';
+  if (!cmd) return;
   const now = Date.now();
   if (now - lastMinAt < 1200) return;
   lastMinAt = now;
-  try { exec('schtasks /run /tn arena_minimize', () => {}); } catch (e) {}
+  try { exec(cmd, () => {}); } catch (e) {}
 }
 
-async function openTab(model, mode, models) {
+async function openTab(model, mode, models, navUrl) {
   const q = [];
   if (model && !/^arena-/.test(model)) q.push('model_a=' + encodeURIComponent(model));
   let base = '/agent';
@@ -345,9 +525,9 @@ async function openTab(model, mode, models) {
     // 对战没有独立路由：首页的 Mode 下拉里选 Battle
     base = '/';
   }
-  const url = 'https://arena.ai' + base + (q.length ? '?' + q.join('&') : '');
+  const url = navUrl || ('https://arena.ai' + base + (q.length ? '?' + q.join('&') : ''));
   // 对战 / 并排每一轮都是独立会话，接管旧页面会把上一轮的问答带进来
-  const adopted = mode === 'battle' || mode === 'side' ? null : await adoptTab(base);
+  const adopted = (navUrl || mode === 'battle' || mode === 'side') ? null : await adoptTab(base);
   if (adopted) {
     log('adopted tab', adopted.tabId, String(adopted.url).slice(0, 60));
     minimizeChrome();
@@ -545,11 +725,11 @@ async function getSession(name, opts) {
     sessions.delete(key); s = null;
     if (histories.has(key)) contextLost.add(key);
   }
-  if (!(await ensureChrome())) throw new Error('chrome unavailable');
+  if (!(await ensureChrome())) throw chromeDownError();
   await evictSessions(key);
   let r = null;
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { r = await openTab(opts.model, opts.mode, opts.models); break; }
+    try { r = await openTab(opts.model, opts.mode, opts.models, opts.url); break; }
     catch (e) {
       log('openTab failed #' + attempt + ': ' + e.message);
       if (attempt === 2) throw e;
@@ -827,7 +1007,10 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname === '/repos' || u.pathname === '/repo') {
     const rn = u.searchParams.get('session') || 'main';
     const want = u.searchParams.get('name') || '';
-    if (u.searchParams.get('cached')) return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
+    // cached=0 / false 不能当缓存：'0' 在 JS 里是真值，会把切换请求吞掉
+    const cachedFlag = u.searchParams.get('cached');
+    if (cachedFlag && cachedFlag !== '0' && cachedFlag !== 'false')
+      return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
     const doRepo = async () => {
       const s = await getSession(rn, { mode: 'agent' });
       await sleep(2500);
@@ -923,23 +1106,6 @@ const server = http.createServer(async (req, res) => {
       send(200, r);
     }).catch(e => { minimizeChrome(); send(e && e.busy ? 429 : 500, { error: e.message }); });
   }
-  if (u.pathname === '/pr') {
-    const repo = (u.searchParams.get('repo') || repoCache.repo || '').trim();
-    const num = (u.searchParams.get('n') || '').trim();
-    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return send(400, { error: 'no repo selected' });
-    if (num && !/^[0-9]+$/.test(num)) return send(400, { error: 'bad pull request number' });
-    const ghArgs = num
-      ? `pr view ${num} --repo ${repo} --json number,title,state,isDraft,mergeable,reviewDecision,url,headRefName,baseRefName,additions,deletions,changedFiles`
-      : `pr list --repo ${repo} --state all --limit 20 --json number,title,state,isDraft,url,headRefName,updatedAt`;
-    return exec(`gh ${ghArgs}`, { timeout: 30000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return send(500, { error: (stderr || err.message || 'gh failed').trim().slice(0, 400) });
-      let data = null;
-      try { data = JSON.parse(stdout); } catch (e) { return send(500, { error: 'unparsable gh output' }); }
-      if (num) return send(200, { repo, pr: data });
-      return send(200, { repo, prs: data });
-    });
-  }
-
   if (u.pathname === '/upload' && req.method === 'POST') {
     let body;
     try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: 'bad json' }); }
@@ -955,7 +1121,7 @@ const server = http.createServer(async (req, res) => {
     }
     const names = files.map(f => path.basename(f));
     const doUp = async () => {
-      if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      if (!(await ensureChrome())) throw chromeDownError();
       const s = await getSession(rn, { mode: 'agent' });
       await waitReady(s.cdp);
       const obj = await s.cdp.send('Runtime.evaluate', { expression: "document.querySelector('input[type=file]')", objectGroup: 'arena-upload' });
@@ -990,7 +1156,7 @@ const server = http.createServer(async (req, res) => {
     const key = session + '#battle';
     const opts = { mode, models, fresh: true };
     const run = async () => {
-      if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      if (!(await ensureChrome())) throw chromeDownError();
       const s = await getSession(key, opts);
       s.busy = true;
       try {
@@ -1033,11 +1199,88 @@ const server = http.createServer(async (req, res) => {
   }
   if (u.pathname === '/new') {
     const name = u.searchParams.get('session') || DEFAULT_SESSION;
-    histories.delete(name); contextLost.delete(name);
+        histories.delete(name); contextLost.delete(name);
     const s = sessions.get(name);
     if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(name); }
+    const bs = sessions.get(name + '#battle');
+    if (bs) { try { await cdpApi('GET', '/json/close/' + bs.tabId); } catch (e) {} try { bs.cdp.close(); } catch (e) {} sessions.delete(name + '#battle'); }
+    battleRounds.delete(name);
     return send(200, { ok: true });
   }
+  if (u.pathname === '/conversations') {
+    const name = u.searchParams.get('session') || DEFAULT_SESSION;
+    try {
+      const s = await getSession(name, { mode: 'agent' });
+      if (await s.cdp.ev(VERIFY_JS)) return send(409, { ok: false, error: 'NEED_VERIFY' });
+      const data = await s.cdp.evJson(CONVERSATIONS_JS);
+      if (!data || !data.ok) return send(500, { ok: false, error: '页面里没读到会话列表' });
+      return send(200, data);
+    } catch (e) {
+      return send(/NEED_VERIFY/.test(e.message) ? 409 : 500, { ok: false, error: e.message });
+    }
+  }
+
+  if (u.pathname === '/history') {
+    const name = u.searchParams.get('session') || DEFAULT_SESSION;
+    const s = sessions.get(name);
+    if (!s) return send(404, { ok: false, error: '这个会话没有打开的标签页（先问一句，或先 /resume 选一个）' });
+    try {
+      const data = await s.cdp.evJson(HISTORY_JS);
+      if (!data || !data.ok) return send(500, { ok: false, error: '页面里没读到对话' });
+      return send(200, Object.assign({ session: name }, data));
+    } catch (e) {
+      return send(500, { ok: false, error: e.message });
+    }
+  }
+
+  if (u.pathname === '/open' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { ok: false, error: 'bad json' }); }
+    const name = body.session || DEFAULT_SESSION;
+    let target = String(body.url || '');
+    if (target.charAt(0) === '/') target = 'https://arena.ai' + target;
+    if (!/^https:\/\/arena\.ai\/(agent|c)\/[0-9a-f-]{8,}/i.test(target)) {
+      return send(400, { ok: false, error: 'url 必须是 arena.ai 的会话地址' });
+    }
+    try {
+      let s = sessions.get(name);
+      if (s && s.busy) return send(409, { ok: false, error: '正在生成，先停下再切换会话' });
+      if (!s) {
+        s = await getSession(name, { mode: body.mode || 'agent', url: target });
+      } else {
+        try {
+          const cur = String(await s.cdp.ev('location.href') || '');
+          if (cur !== target) {
+            // 后台标签页的重载会被 Chrome 节流，先提到前台再导航
+            await s.cdp.send('Page.bringToFront').catch(() => {});
+            await s.cdp.send('Page.navigate', { url: target });
+          }
+          await waitReady(s.cdp, 25000);
+        } catch (e) {
+          // 标签页可能已经卡死（渲染进程崩了但 JS 还活着），换一个新标签页重来
+          log('open failed on existing tab, reopening: ' + e.message);
+          try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e2) {}
+          try { s.cdp.close(); } catch (e2) {}
+          sessions.delete(name);
+          s = await getSession(name, { mode: body.mode || 'agent', url: target });
+        }
+        // 对话正文比输入框晚一点渲染，等它出来再让客户端读历史
+        for (let i = 0; i < 10; i++) {
+          const got = await s.cdp.ev("!!document.querySelector('[data-user-message-body-row=\"true\"],[data-agent-transcript-message=\"true\"],.prose')").catch(() => false);
+          if (got) break;
+          await sleep(400);
+        }
+      }
+      // 页面已经是唯一上下文，旧的回放缓存作废
+      histories.delete(name);
+      contextLost.delete(name);
+      minimizeChrome();
+      return send(200, { ok: true, session: name, url: target });
+    } catch (e) {
+      return send(/NEED_VERIFY/.test(e.message) ? 409 : 500, { ok: false, error: e.message });
+    }
+  }
+
   if ((u.pathname === '/v1/chat/completions' || u.pathname === '/chat/completions') && req.method === 'POST') {
     let body;
     try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return send(400, { error: { message: 'bad json', type: 'invalid_request_error' } }); }
@@ -1102,11 +1345,11 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     let live = null;   // 本轮真正用的 session，出错时要靠它停生成/重置
 
     const run = async () => {
-      if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      if (!(await ensureChrome())) throw chromeDownError();
       // 常驻 battle/side 模式：普通提问也走并排，两栏答案合成一条消息
       if (opts.mode === 'battle' || opts.mode === 'side') {
         const key = name + '#battle';
-        if (!(await ensureChrome())) throw new Error('chrome unavailable');
+        if (!(await ensureChrome())) throw chromeDownError();
         const s2 = await getSession(key, { mode: opts.mode, models: opts.models, fresh: true });
         live = s2;
         s2.busy = true;
@@ -1218,7 +1461,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     let live = null;
 
     const run = async () => {
-      if (!(await ensureChrome())) throw new Error('chrome unavailable');
+      if (!(await ensureChrome())) throw chromeDownError();
       const s = await getSession(name, opts);
       live = s;
       s.busy = true;

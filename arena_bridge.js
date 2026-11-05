@@ -10,7 +10,7 @@ const path = require('path');
 const { exec, spawn } = require('child_process');
 const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -1057,89 +1057,52 @@ const server = http.createServer(async (req, res) => {
     if (cachedFlag && cachedFlag !== '0' && cachedFlag !== 'false')
       return send(200, { repo: repoCache.repo, repos: repoCache.repos, cached: true });
     const doRepo = async () => {
-      const s = await getSession(rn, { mode: 'agent' });
-      await sleep(2500);
-      let list = { items: [] };
-      const readList = async () => {
-        const raw = await s.cdp.ev(LIST_REPOS_JS);
-        try { return raw ? JSON.parse(raw) : { items: [] }; } catch (e) { return { items: [] }; }
-      };
+      // 仓库芯片只长在「还没开始对话」的 /agent 页面上。一旦进了具体会话，
+      // 输入框下面只剩一条只读的仓库栏（仓库 + 分支 + Create PR），点不开选择器。
+      // 所以：读列表用专门的空白页，切换则必须把会话页导航回 /agent。
+      const key = want ? rn : rn + '#repos';
+      const s = await getSession(key, { mode: 'agent', url: 'https://arena.ai/agent' });
+      if (want) await s.cdp.send('Page.navigate', { url: 'https://arena.ai/agent' }).catch(() => {});
+      await waitReady(s.cdp);
       const escKey = async () => {
         await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
         await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
         await sleep(400);
       };
-      list = await readList();
-      if (!(list.items && list.items.length)) {
-        const chipPos0 = await s.cdp.ev(CHIP_POS_JS);
-        if (chipPos0 && chipPos0.charAt(0) === '{') {
-          log('clicked repo chip');
-          await realClick(s.cdp, JSON.parse(chipPos0));
-          await sleep(1600);
-          for (let i = 0; i < 8; i++) {
-            list = await readList();
-            if (list.items && list.items.length) break;
-            await sleep(600);
-          }
-        }
-      }
-      if (!(list.items && list.items.length)) {
-        await escKey();
-        let addPos = '';
-        for (let i = 0; i < 14; i++) {
-          addPos = await s.cdp.ev(OUTER_GH_POS_JS);
-          if (addPos && addPos.charAt(0) === '{') break;
-          addPos = '';
-          await sleep(600);
-        }
-        if (!addPos) throw new Error('\u627e\u4e0d\u5230\u8f93\u5165\u6846\u4e0b\u65b9\u7684 GitHub \u6309\u94ae');
-        await realClick(s.cdp, JSON.parse(addPos));
-        log('clicked outer GitHub');
-        let chipPos1 = '';
-        for (let i = 0; i < 30; i++) {
-          await sleep(1000);
-          chipPos1 = await s.cdp.ev(CHIP_POS_JS);
-          if (chipPos1 && chipPos1.charAt(0) === '{') break;
-          chipPos1 = '';
-        }
-        if (!chipPos1) throw new Error('\u70b9\u4e86 GitHub \u4f46\u4ed3\u5e93\u82af\u7247\u6ca1\u51fa\u6765');
-        if (want && (await s.cdp.ev(CHIP_TEXT_JS)) === want) {
-          return { ok: true, repo: want, repos: list.items, changed: false };
-        }
-        log('clicked repo chip after attach');
-        await realClick(s.cdp, JSON.parse(chipPos1));
-        await sleep(1800);
-        for (let i = 0; i < 12; i++) {
-          list = await readList();
-          if (list.items && list.items.length) break;
-          await sleep(700);
-        }
-      }
-      if (!(list.items && list.items.length)) throw new Error('\u5f39\u5c42\u91cc\u6ca1\u8bfb\u5230\u4ed3\u5e93\u5217\u8868\uff08GitHub \u672a\u8fde\u63a5\uff1f\uff09');
-      if (!want) {
-        await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
-        await sleep(500);
-        return { repo: await s.cdp.ev(CHIP_TEXT_JS), repos: list.items };
-      }
-      const curChip = await s.cdp.ev(CHIP_TEXT_JS);
-      if (curChip && curChip === want) return { ok: true, repo: curChip, repos: list.items, changed: false };
-      let pos = '';
+      const readList = async () => {
+        const raw = await s.cdp.ev(LIST_REPOS_JS).catch(() => '');
+        try { return raw ? JSON.parse(raw) : { items: [] }; } catch (e) { return { items: [] }; }
+      };
+      let chip = await s.cdp.ev(CHIP_TEXT_JS).catch(() => '');
+      for (let i = 0; i < 10 && !chip; i++) { await sleep(700); chip = await s.cdp.ev(CHIP_TEXT_JS).catch(() => ''); }
+      if (!chip) throw new Error('页面上没有仓库芯片（会话页面？）');
+      if (want && chip === want) return { ok: true, repo: chip, repos: repoCache.repos || [], changed: false };
+      const chipPos = await s.cdp.ev(CHIP_POS_JS).catch(() => '');
+      if (!chipPos || chipPos.charAt(0) !== '{') throw new Error('找不到仓库芯片的位置');
+      await realClick(s.cdp, JSON.parse(chipPos));
+      await sleep(1500);
+      let list = { items: [] };
       for (let i = 0; i < 10; i++) {
-        pos = await s.cdp.ev(repoPosJs(want));
-        if (pos && pos.charAt(0) === '{') break;
-        pos = '';
-        await sleep(500);
-      }
-      if (!pos) throw new Error('\u5217\u8868\u91cc\u6ca1\u6709 ' + want + ' | available: ' + list.items.join(', '));
-      await realClick(s.cdp, JSON.parse(pos));
-      await sleep(1400);
-      if (await s.cdp.ev(DIALOG_OPEN_JS) === '1') {
-        await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+        list = await readList();
+        if (list.items && list.items.length) break;
         await sleep(600);
       }
-      let chip = '';
-      for (let k = 0; k < 8; k++) { chip = await s.cdp.ev(CHIP_TEXT_JS); if (chip === want) break; await sleep(700); }
-      return { ok: true, repo: chip || want, repos: list.items, changed: true };
+      if (!list.items || !list.items.length) { await escKey(); throw new Error('弹层里没读到仓库列表（GitHub 未连接？）'); }
+      if (!want) { await escKey(); return { repo: chip, repos: list.items }; }
+      let pos = '';
+      for (let i = 0; i < 10; i++) {
+        pos = await s.cdp.ev(repoPosJs(want)).catch(() => '');
+        if (pos && pos.charAt(0) === '{') break;
+        pos = '';
+        await sleep(400);
+      }
+      if (!pos) { await escKey(); throw new Error('列表里没有 ' + want + ' | available: ' + list.items.join(', ')); }
+      await realClick(s.cdp, JSON.parse(pos));
+      await sleep(1200);
+      if (await s.cdp.ev(DIALOG_OPEN_JS) === '1') await escKey();
+      let after = '';
+      for (let i = 0; i < 10; i++) { after = await s.cdp.ev(CHIP_TEXT_JS).catch(() => ''); if (after === want) break; await sleep(600); }
+      return { ok: true, repo: after || want, repos: list.items, changed: true };
     };
     // 走同一个队列：否则切仓库会在一轮回答跑到一半时去点页面，把正在生成的状态搅乱
     return enqueue(doRepo).then(r => {

@@ -74,7 +74,7 @@ arena_bridge.js（node，无第三方依赖）
 | `start_bridge.ps1`、`start-arena-chrome.cmd` | 计划任务调用，负责把桥和 Chrome 拉起来 |
 | `arb.ps1`、`rd2.js` | 早期的远程调用入口（base64 传问题、gzip 回传结果），脚本里还在用 |
 
-`cli/` 和 `codex/` 是 Qwen Code / Codex 时代的旧客户端，`patches/` 是那时打的补丁，都已被 arena-lite 取代，留在仓库里仅作历史参考。
+`cli/`、`codex/`、`patches/` 是 Qwen Code / Codex 时代的旧客户端与补丁，已被 arena-lite 取代，2026-11-05 从仓库删除（`git log` 里还能翻到）。
 
 ## 快速开始
 

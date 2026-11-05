@@ -78,12 +78,30 @@ arena_bridge.js（node，无第三方依赖）
 
 ## 快速开始
 
-电脑侧（Windows，需 Chrome 与 node ≥ 21）：
+**推荐走安装包**：桥跟着客户端一起发。到
+[ArenaCodeCLILite Releases](https://github.com/Therenery/ArenaCodeCLILite/releases/latest)
+下 `arena-setup-<版本>.zip`，解压双击 `install.cmd`，桥会装到
+`%LOCALAPPDATA%\Programs\Arena\bridge\`，随 `arena` 命令按需拉起。
+
+只想单独跑桥：
 
 ```powershell
-schtasks /run /tn chrome-arena     # Chrome 带 --remote-debugging-port=9222
-schtasks /run /tn arena-bridge     # 桥接服务
+git clone https://github.com/Therenery/arena-bridge
+cd arena-bridge
+node arena_bridge.js
 curl.exe http://127.0.0.1:17892/health
+```
+
+桥会自己找 Chrome / Edge，用独立的 profile（`%USERPROFILE%\.arena-bridge\chrome-profile`）
+带 `--remote-debugging-port=9222` 拉起来，不碰你日常用的浏览器。
+第一次要在弹出的窗口里登录 arena.ai。
+
+要指定浏览器或换 profile：
+
+```powershell
+$env:ARB_CHROME = 'D:\Chrome\chrome.exe'
+$env:ARB_PROFILE = 'D:\arena-profile'
+node arena_bridge.js
 ```
 
 手机侧装 `arena-lite` 后：
@@ -108,10 +126,10 @@ model    = arena-agent
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `ARB_STATE_DIR` | `F:/__AI__/work` | 仓库缓存、调试转储的目录 |
+| `ARB_STATE_DIR` | `~/.arena-bridge` | 仓库缓存、会话地址、Chrome profile、调试转储的目录 |
 | `ARB_MAX_SESSIONS` | `6` | 常驻标签页上限，超了按最久未用淘汰 |
 | `ARB_UPLOAD_ROOTS` | 空（不限制） | `/upload` 允许外发的目录白名单，`;`（Windows）或 `:` 分隔 |
-| `ARB_RESTORE_CMD` | Windows 下 `schtasks /run /tn arena_restore` | 撞上人机验证时把浏览器窗口拉到前台，叫人去过验证 |
+| `ARB_RESTORE_CMD` | Windows 下 `schtasks /run /tn arena_restore`（安装包会改成调 `scripts\restore-chrome.ps1`） | 撞上人机验证时把浏览器窗口拉到前台，叫人去过验证 |
 | `ARB_SSE_PING_MS` | `15000` | SSE 心跳间隔，防长任务被客户端判空闲 |
 | `ARB_DEBUG_PROMPT` | 关 | 设为 `1` 才把 prompt 正文写日志/落盘 |
 | `ARB_TOKEN` | 空（不校验） | 非空时所有接口（除 `/health`）要求 `Authorization: Bearer <token>` |
@@ -122,28 +140,41 @@ model    = arena-agent
 
 桥在 `needVerify()` 里做三件事，然后抛 `NEED_VERIFY`：
 
-1. 执行 `ARB_RESTORE_CMD`（Windows 默认 `schtasks /run /tn arena_restore`）
+1. 执行 `ARB_RESTORE_CMD`
 2. 对该标签页发 `Page.bringToFront`
 3. 客户端收到 `NEED_VERIFY`，在对话区打红色横幅
 
-**Windows 上必须借计划任务跨会话。** 桥的 node 跑在 session 0，Chrome 在 session 1，
-桥自己 spawn 的 PowerShell 够不到桌面窗口，窗口还原会静默失败。
+用安装包装的话不用管这一节，安装程序已经把 `ARB_RESTORE_CMD` 设成：
 
-前置条件（一次性）：
+```
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File <安装目录>\scripts\restore-chrome.ps1
+```
+
+桥和浏览器在同一个用户会话里，脚本直接抢前台就行。
+
+脚本挑窗口时优先找标题里带 `arena` 的那个，找不到才退回任意一个有窗口的 Chrome / Edge。
+然后 `IsIconic` 判断是否最小化，是就 `ShowWindow(h, 9)`（`SW_RESTORE`）；
+再 `AttachThreadInput` 把前台线程和自己的输入队列接上，`BringWindowToTop` +
+`SetForegroundWindow`，最后解绑。这样能绕过 Windows 的前台锁。
+
+#### 从 SSH / 计划任务启动桥
+
+那种情况下桥在 session 0、Chrome 在 session 1，桥自己 spawn 的 PowerShell 够不到桌面窗口，
+窗口还原会静默失败。得借计划任务跨会话：
 
 | 项 | 值 |
 |---|---|
-| 脚本 | `F:\__AI__\work\restore-chrome.ps1` |
+| 脚本 | `installer/scripts/restore-chrome.ps1`（客户端仓库） |
 | 任务名 | `\arena_restore` |
 | 触发 | 无（只手动运行） |
 | 账户 | 当前交互用户，`InteractiveToken`，「只在用户登录时运行」 |
 
-脚本先 `IsIconic` 判断是否最小化，是就 `ShowWindow(h, 9)`（`SW_RESTORE`）；
-再 `AttachThreadInput` 把前台线程和自己的输入队列接上，`BringWindowToTop` +
-`SetForegroundWindow`，最后解绑。这样能绕过 Windows 的前台锁。
+```powershell
+schtasks /create /tn arena_restore /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\path\to\restore-chrome.ps1" /sc once /st 00:00 /f
+[Environment]::SetEnvironmentVariable('ARB_RESTORE_CMD', 'schtasks /run /tn arena_restore', 'User')
+```
 
 任务没建也能跑，只是 `schtasks` 报错、浏览器留在后台，验证得自己去点开。
-
 ## 安全设计
 
 | 项 | 做法 |

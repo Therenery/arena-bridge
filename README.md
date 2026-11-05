@@ -118,6 +118,32 @@ model    = arena-agent
 | `ARB_MAX_PROMPT_CHARS` | `6000` | 单轮 prompt 字符上限，超出截断并在响应里标记 |
 | `ARB_MAX_HISTORY_KEYS` | `32` | 桥内部保存的会话历史条数上限（按键 LRU） |
 
+### 撞上人机验证时拉焦点
+
+桥在 `needVerify()` 里做三件事，然后抛 `NEED_VERIFY`：
+
+1. 执行 `ARB_RESTORE_CMD`（Windows 默认 `schtasks /run /tn arena_restore`）
+2. 对该标签页发 `Page.bringToFront`
+3. 客户端收到 `NEED_VERIFY`，在对话区打红色横幅
+
+**Windows 上必须借计划任务跨会话。** 桥的 node 跑在 session 0，Chrome 在 session 1，
+桥自己 spawn 的 PowerShell 够不到桌面窗口，窗口还原会静默失败。
+
+前置条件（一次性）：
+
+| 项 | 值 |
+|---|---|
+| 脚本 | `F:\__AI__\work\restore-chrome.ps1` |
+| 任务名 | `\arena_restore` |
+| 触发 | 无（只手动运行） |
+| 账户 | 当前交互用户，`InteractiveToken`，「只在用户登录时运行」 |
+
+脚本先 `IsIconic` 判断是否最小化，是就 `ShowWindow(h, 9)`（`SW_RESTORE`）；
+再 `AttachThreadInput` 把前台线程和自己的输入队列接上，`BringWindowToTop` +
+`SetForegroundWindow`，最后解绑。这样能绕过 Windows 的前台锁。
+
+任务没建也能跑，只是 `schtasks` 报错、浏览器留在后台，验证得自己去点开。
+
 ## 安全设计
 
 | 项 | 做法 |

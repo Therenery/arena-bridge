@@ -583,7 +583,8 @@ async function openTab(model, mode, models, navUrl) {
   const c = await connectTab(tab.id);
   await c.send('Page.addScriptToEvaluateOnNewDocument', { source: INJECT });
   await c.send('Page.navigate', { url });
-  await waitReady(c);
+  // 打开已有会话时要等历史渲染完，比空白页慢
+  await waitReady(c, navUrl ? 45000 : undefined);
   if (mode === 'battle') {
     // 首页默认就是 battle，但用户上次选过别的模式时要显式切回来
     await c.ev("(function(){var s=document.querySelector('select');if(!s||s.value==='battle')return;var d=Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value');d.set.call(s,'battle');s.dispatchEvent(new Event('change',{bubbles:true}));})()").catch(() => {});
@@ -726,6 +727,18 @@ const battleRounds = new Map();
 // 标签页被关掉/重建后，页面自己的上下文没了；下一条请求要把服务端历史补进 prompt，
 // 否则对话中途遇到一次错误就悄悄失忆，用户只会觉得「它怎么忘了刚才说的」
 const contextLost = new Set();
+// 会话名 -> 网页端会话地址。标签页被淘汰或重建时导航回去，页面自己会把完整历史
+//（包括人工在网页上做的操作）加载回来，比拿内存里的 histories 回放可靠。
+// 存盘是因为桥一重启内存就空了，那样记了也白记。
+const SESSION_URLS_FILE = path.join(STATE_DIR, 'session-urls.json');
+const sessionUrls = new Map();
+try {
+  const j = JSON.parse(fs.readFileSync(SESSION_URLS_FILE, 'utf8'));
+  for (const k of Object.keys(j)) if (typeof j[k] === 'string') sessionUrls.set(k, j[k]);
+} catch (e) {}
+function saveSessionUrls() {
+  try { fs.writeFileSync(SESSION_URLS_FILE, JSON.stringify(Object.fromEntries(sessionUrls))); } catch (e) {}
+}
 
 function setHistory(name, h) {
   histories.delete(name);
@@ -773,15 +786,27 @@ async function getSession(name, opts) {
   if (!(await ensureChrome())) throw chromeDownError();
   await evictSessions(key);
   let r = null;
+  if (opts.fresh) { sessionUrls.delete(key); saveSessionUrls(); } // 新会话不留旧地址
+  // 标签页没了就导航回原会话，页面自己加载完整历史
+  let resumeUrl = opts.fresh ? null : (opts.url || sessionUrls.get(key) || null);
   for (let attempt = 0; attempt < 3; attempt++) {
-    try { r = await openTab(opts.model, opts.mode, opts.models, opts.url); break; }
+    try { r = await openTab(opts.model, opts.mode, opts.models, resumeUrl); break; }
     catch (e) {
       log('openTab failed #' + attempt + ': ' + e.message);
+      if (resumeUrl && !opts.url) {
+        // 记下的地址打不开（会话被删了），丢掉它退回首页，别一直撞
+        log('resume url unusable, falling back: ' + resumeUrl);
+        sessionUrls.delete(key);
+        saveSessionUrls();
+        resumeUrl = null;
+        continue;
+      }
       if (attempt === 2) throw e;
       await sleep(1500);
       await ensureChrome();
     }
   }
+  if (resumeUrl) contextLost.delete(key); // 页面自带历史，不用回放
   s = { name: key, tabId: r.tabId, cdp: r.cdp, model: opts.model || '', mode: opts.mode || 'direct', lastAsk: 0, busy: false };
   sessions.set(key, s);
   return s;
@@ -1224,7 +1249,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (u.pathname === '/new') {
     const name = u.searchParams.get('session') || DEFAULT_SESSION;
-        histories.delete(name); contextLost.delete(name);
+        histories.delete(name); contextLost.delete(name); sessionUrls.delete(name); saveSessionUrls();
     const s = sessions.get(name);
     if (s) { try { await cdpApi('GET', '/json/close/' + s.tabId); } catch (e) {} try { s.cdp.close(); } catch (e) {} sessions.delete(name); }
     const bs = sessions.get(name + '#battle');
@@ -1299,6 +1324,8 @@ const server = http.createServer(async (req, res) => {
       // 页面已经是唯一上下文，旧的回放缓存作废
       histories.delete(name);
       contextLost.delete(name);
+      sessionUrls.set(name, target);
+      saveSessionUrls();
       minimizeChrome();
       return send(200, { ok: true, session: name, url: target });
     } catch (e) {
@@ -1413,6 +1440,14 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
           setHistory(name, h);
           contextLost.delete(name);
         }
+        // 第一轮之后地址会变成 /agent/<id>；人工在网页上切过会话也能跟上
+        try {
+          const href = String((await s.cdp.ev('location.href')) || '');
+          if (/^https:\/\/arena\.ai\/(agent|c)\/[0-9a-f-]{8,}/i.test(href) && sessionUrls.get(name) !== href) {
+            sessionUrls.set(name, href);
+            saveSessionUrls();
+          }
+        } catch (e) {}
         return r;
       } finally {
         s.busy = false;

@@ -184,7 +184,7 @@ schtasks /create /tn arena_restore /tr "powershell -NoProfile -WindowStyle Hidde
 | 监听 | 只绑 127.0.0.1 |
 | 并发 | 全局队列串行（同时只跑 1 个），排队上限 4；队列满返回 429 |
 | 鉴权 | 可选 `ARB_TOKEN`；隧道场景建议开启 |
-| 外发面 | `/upload` 只允许白名单目录内的文件，越界返回 403 |
+| 外发面 | `/upload` 默认不限制；设了 `ARB_UPLOAD_ROOTS` 就只允许白名单目录，越界返回 403 |
 | 取消 | 客户端断开后当前轮次立即停止，不再占着队列跑满 10 分钟 |
 | 频率 | 两次请求最小间隔 3 秒 |
 | 输入 | 真键盘事件，页面看到的是人 |

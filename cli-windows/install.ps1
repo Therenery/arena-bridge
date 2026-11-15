@@ -46,12 +46,28 @@ foreach ($p in $cands) {
   if ($p -and (Test-Path -LiteralPath $p)) { $node = $p; break }
 }
 if (-not $node) {
+  $wg = Get-Command winget -ErrorAction SilentlyContinue
+  if ($wg -and [Environment]::UserInteractive) {
+    $ans = Read-Host "未检测到 Node.js，是否用 winget 自动安装 Node.js LTS？[Y/n]"
+    if (-not $ans -or $ans -match "^[yY]$") {
+      & $wg.Source install -e --id OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
+      foreach ($np in @(
+        (Join-Path $env:ProgramFiles "nodejs\node.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "nodejs\node.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe")
+      )) {
+        if ($np -and (Test-Path -LiteralPath $np)) { $node = $np; break }
+      }
+    }
+  }
+}
+if (-not $node) {
   Die @'
 没找到 Node.js。桥是一段 node 程序，没有它跑不起来。
 
   装一个：https://nodejs.org/  （选 LTS，一路下一步）
   装完关掉这个窗口重新双击 install.cmd
-'@
+@'
 }
 $verText = (& $node -v 2>$null)
 if ($verText -notmatch '^v(\d+)\.') { Die "node 版本读不出来：$verText" }

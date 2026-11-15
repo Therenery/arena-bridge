@@ -11,7 +11,7 @@ const path = require('path');
 const { exec, spawn } = require('child_process');
 const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.4.7';
+const VERSION = '0.4.8';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -844,7 +844,10 @@ async function typePrompt(c, text) {
     await sleep(1200);
     ok = (await c.ev(VAL_JS)) <= 1;
   }
-  if (!ok) throw new Error('send failed (composer still holds text)');
+  if (!ok) {
+    if (await c.ev(VERIFY_JS).catch(() => false)) throw needVerify(c);
+    throw new Error('send failed (composer still holds text)');
+  }
 }
 
 
@@ -1652,7 +1655,8 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
           s2.busy = false;
         }
       }
-      const s = await getSession(name, opts);
+      for (let attempt = 0; attempt < 2; attempt++) {
+      const s = await getSession(name, attempt ? Object.assign({}, opts, { fresh: true }) : opts);
       live = s;
       s.busy = true;   // 淘汰与退出都看这个字段，别把正在跑的会话连根拔掉
       try {
@@ -1683,8 +1687,16 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
           }
         } catch (e) {}
         return r;
+      } catch (err) {
+        if (attempt === 0 && !clientGone && /typing failed|send failed \(composer still holds text\)|Page\.navigate timeout|page not ready/i.test(String(err && err.message || ""))) {
+          log("ui glitch, retrying once:", err.message);
+          resetSession(name, "retry: " + err.message);
+          continue;
+        }
+        throw err;
       } finally {
         s.busy = false;
+      }
       }
     };
 

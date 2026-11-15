@@ -5,12 +5,13 @@
  * passively tap the page's own fetch stream. No cookies stored, no tokens minted.
  */
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { exec, spawn } = require('child_process');
 const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.4.4';
+const VERSION = '0.4.7';
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -164,7 +165,7 @@ const INJECT = String.raw`
   window.__arbInstalled = true;
   window.__arbSeq = 0;
   window.__arbStreams = [];
-  const interesting = u => /nextjs-api\/stream|ai-proxy\/realtime/i.test(u);
+  const interesting = u => /nextjs-api\/stream|ai-proxy\/realtime|\/api\/chat\/[^/]+\/events/i.test(u);
   const push = (st, o) => {
     try { st.frames.push(o); if (st.frames.length > 30000) { st.frames.splice(0, 10000); st.base = (st.base || 0) + 10000; } } catch (e) {}
   };
@@ -342,25 +343,154 @@ async function ensureChrome() {
 }
 
 const VERIFY_JS = "(()=>{try{var t=document.body.innerText||'';return /Just a moment|Verify you are human|确认您是真人|Checking your browser|Attention Required/i.test(t)||!!document.querySelector('iframe[src*=challenges.cloudflare.com],#challenge-form,#challenge-stage')}catch(e){return false}})()";
+// 助手回复里的图片：arena 把沙盒产出的文件以 data: URL 的 <img> 塞进正文，
+// 外链图也一并收。头像（24px 的 googleusercontent）按尺寸过滤掉。
+const IMAGES_JS = String.raw`(async function(){
+  function ok(im){
+    var src = String(im.currentSrc || im.src || '');
+    if (!/^data:image\//.test(src) && !/^https?:\/\//.test(src)) return false;
+    if (/googleusercontent\.com\/a\//.test(src)) return false;
+    var r = im.getBoundingClientRect();
+    var w = im.naturalWidth || r.width, h = im.naturalHeight || r.height;
+    return Math.max(w, h) >= 64;
+  }
+  function toDataUrl(src){
+    if (/^data:/.test(src)) return Promise.resolve(src);
+    return fetch(src, {credentials:'include'}).then(function(r){ return r.blob(); }).then(function(b){
+      return new Promise(function(res, rej){
+        var fr = new FileReader();
+        fr.onload = function(){ res(String(fr.result || '')); };
+        fr.onerror = function(){ rej(new Error('read failed')); };
+        fr.readAsDataURL(b);
+      });
+    });
+  }
+  var turns = [].slice.call(document.querySelectorAll('[data-agent-transcript-message="true"]'));
+  var root = turns.length ? turns[turns.length - 1] : document.body;
+  var imgs = [].slice.call(root.querySelectorAll('img')).filter(ok);
+  var out = [];
+  for (var i = 0; i < imgs.length && out.length < 6; i++) {
+    try {
+      var d = await toDataUrl(String(imgs[i].currentSrc || imgs[i].src || ''));
+      var m = d.match(/^data:([^;,]+)[^,]*,(.*)$/);
+      if (!m || m[2].length > 12000000) continue;
+      out.push({ name: (imgs[i].alt || '').slice(0, 80), mime: m[1], data: m[2] });
+    } catch (e) {}
+  }
+  return JSON.stringify(out);
+})()`;
+
+const HAS_IMG_JS = "(()=>{var t=[].slice.call(document.querySelectorAll('[data-agent-transcript-message=\"true\"]'));var r=t.length?t[t.length-1]:document.body;return [].slice.call(r.querySelectorAll('img')).some(function(im){var q=im.getBoundingClientRect();return Math.max(im.naturalWidth||q.width,im.naturalHeight||q.height)>=64})})()";
+
+// 图有时比文字晚一步渲染，头几次没抓到就等一会儿再看
+async function collectImages(c) {
+  for (let i = 0; i < 4; i++) {
+    try {
+      if (await c.ev(HAS_IMG_JS)) {
+        const raw = await c.ev(IMAGES_JS);
+        if (raw && raw.charAt(0) === '[') {
+          const list = JSON.parse(raw);
+          if (Array.isArray(list) && list.length) return list;
+        }
+      }
+    } catch (e) {}
+    await sleep(400);
+  }
+  return [];
+}
+
+// 把一组图片 URL 在页面里抓成 base64：r2 的图走浏览器最省事，cookie 都现成
+// R2 的图在页面里 fetch 会被 CORS 拦，退回 Node 直接下
+function downloadImage(u, depth) {
+  depth = depth || 0;
+  return new Promise((resolve) => {
+    if (depth > 3) return resolve(null);
+    let mod;
+    try { mod = new URL(u).protocol === 'https:' ? https : http; } catch (e) { return resolve(null); }
+    const req = mod.get(u, { timeout: 20000, headers: { accept: 'image/*,*/*' } }, (res) => {
+      const code = res.statusCode || 0;
+      if (code >= 300 && code < 400 && res.headers.location) {
+        res.resume();
+        return resolve(downloadImage(new URL(res.headers.location, u).toString(), depth + 1));
+      }
+      if (code !== 200) { res.resume(); return resolve(null); }
+      const mime = String(res.headers['content-type'] || '').split(';')[0].trim();
+      const chunks = [];
+      let len = 0;
+      res.on('data', (d) => {
+        len += d.length;
+        if (len > 12000000) { req.destroy(); resolve(null); return; }
+        chunks.push(d);
+      });
+      res.on('end', () => {
+        if (!/^image\//i.test(mime)) return resolve(null);
+        resolve({ mime, data: Buffer.concat(chunks).toString('base64') });
+      });
+      res.on('error', () => resolve(null));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+async function grabImages(c, urls) {
+  const list = (urls || []).filter(u => /^https?:|^data:/.test(String(u))).slice(0, 6);
+  if (!list.length) return [];
+  const js = '(async function(){var urls=' + JSON.stringify(list) + ';var out=[];for(var i=0;i<urls.length;i++){try{var r=await fetch(urls[i],{credentials:"include"});var b=await r.blob();var d=await new Promise(function(res,rej){var fr=new FileReader();fr.onload=function(){res(String(fr.result||""))};fr.onerror=rej;fr.readAsDataURL(b)});var m=d.match(/^data:([^;,]+)[^,]*,(.*)$/);if(m&&m[2].length<=12000000)out.push({mime:m[1],data:m[2]})}catch(e){}}return JSON.stringify(out)})()';
+  try {
+    const raw = await c.ev(js);
+    const arr = raw && raw.charAt(0) === '[' ? JSON.parse(raw) : [];
+    if (Array.isArray(arr) && arr.length) return arr;
+  } catch (e) {}
+  const out = [];
+  for (const u of list) {
+    if (u.slice(0, 5) === 'data:') {
+      const m = u.match(/^data:([^;,]+)[^,]*,(.*)$/);
+      if (m) out.push({ mime: m[1], data: m[2] });
+      continue;
+    }
+    const im = await downloadImage(u);
+    if (im) out.push(im);
+  }
+  return out;
+}
+
 const EDITOR_SEL = `document.querySelector('textarea[name=message]')||document.querySelector('.ProseMirror[contenteditable="true"]')`;
 const READY_JS = `!!(${EDITOR_SEL})`;
 const VAL_JS = `(function(){var e=${EDITOR_SEL};if(!e)return 0;var v=(e.value!==undefined?e.value:(e.innerText||''));return String(v).replace(/[\s\u00a0\u200b]/g,'').length})()`;
 
 
 // 左侧栏的会话列表：每个会话是一个指向 /agent/<uuid> 或 /c/<uuid> 的链接
-const CONVERSATIONS_JS = String.raw`JSON.stringify((function(){
+const CONVERSATIONS_JS = String.raw`(async function(){
   var out=[], seen={};
-  var as=[].slice.call(document.querySelectorAll('a[href]'));
-  as.forEach(function(a){
-    var h=a.getAttribute('href')||'';
-    var m=h.match(/^\/(agent|c)\/([0-9a-f-]{8,})/i);
-    if(!m||seen[h]) return;
-    seen[h]=1;
-    var t=String(a.innerText||'').replace(/\u00a0/g,' ').trim().split('\n')[0].trim();
-    out.push({id:m[2], url:h, kind:m[1], title:t.slice(0,120)});
-  });
-  return {ok:true, conversations:out.slice(0,60), url:location.href};
-})())`;
+  try {
+    var r = await fetch('/api/history/unified?limit=40&includeArchived=false', {credentials:'include'});
+    if (r && r.ok) {
+      var j = await r.json();
+      var es = (j && j.entries) || [];
+      es.forEach(function(e){
+        if (!e || !e.id) return;
+        var kind = e.type === 'agentic' ? 'agent' : 'c';
+        var h = '/' + kind + '/' + e.id;
+        if (seen[h]) return;
+        seen[h] = 1;
+        out.push({id:e.id, url:h, kind:kind, title:String(e.title||'').trim().slice(0,120)});
+      });
+    }
+  } catch (e) {}
+  if (!out.length) {
+    var as=[].slice.call(document.querySelectorAll('a[href]'));
+    as.forEach(function(a){
+      var h=a.getAttribute('href')||'';
+      var m=h.match(/^\/(agent|c)\/([0-9a-f-]{8,})/i);
+      if(!m||seen[h]) return;
+      seen[h]=1;
+      var t=String(a.innerText||'').replace(/\u00a0/g,' ').trim().split('\\n')[0].trim();
+      out.push({id:m[2], url:h, kind:m[1], title:t.slice(0,120)});
+    });
+  }
+  return JSON.stringify({ok:true, conversations:out.slice(0,60), url:location.href});
+})()`;
 
 // 从当前页面读对话。Agent 页有明确的角色属性；/c/ 页只有气泡样式，按气泡对齐猜。
 //
@@ -557,6 +687,31 @@ function needVerify(c) {
   return new Error('NEED_VERIFY');
 }
 
+// arena 的模式选择现在是按钮 + 菜单，不再吃 <select>；两种都兼容
+const MODE_BTN_JS = "(function(){var bs=[].slice.call(document.querySelectorAll('button[role=combobox]'));for(var i=0;i<bs.length;i++){var t=(bs[i].innerText||'').trim();if(/^(Agent|Battle|Direct|Side)/i.test(t)){var r=bs[i].getBoundingClientRect();if(r.width>4)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:t})}}return ''})()";
+
+async function setMode(c, mode) {
+  const want = { battle: 'Battle', agent: 'Agent', direct: 'Direct', side: 'Side' }[mode];
+  if (!want) return;
+  for (let i = 0; i < 3; i++) {
+    const raw = await c.ev(MODE_BTN_JS).catch(() => '');
+    if (raw && raw.charAt(0) === '{') {
+      const p = JSON.parse(raw);
+      if (new RegExp('^' + want, 'i').test(p.t)) return;
+      await realClick(c, p);
+      await sleep(700);
+      const ok = await c.ev("(function(){var w=" + JSON.stringify(want) + ";var os=[].slice.call(document.querySelectorAll('[role=option]'));for(var i=0;i<os.length;i++){var t=(os[i].innerText||'').trim();if(t.indexOf(w)===0){os[i].click();return 'ok'}}return ''})()").catch(() => '');
+      await sleep(900);
+      if (ok === 'ok') return;
+      continue;
+    }
+    // 老界面兜底
+    await c.ev("(function(){var s=document.querySelector('select');if(!s||s.value===" + JSON.stringify(mode) + ")return;var d=Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value');d.set.call(s," + JSON.stringify(mode) + ");s.dispatchEvent(new Event('change',{bubbles:true}));})()").catch(() => {});
+    await sleep(900);
+    return;
+  }
+}
+
 async function openTab(model, mode, models, navUrl) {
   const q = [];
   if (model && !/^arena-/.test(model)) q.push('model_a=' + encodeURIComponent(model));
@@ -585,10 +740,11 @@ async function openTab(model, mode, models, navUrl) {
   await c.send('Page.navigate', { url });
   // 打开已有会话时要等历史渲染完，比空白页慢
   await waitReady(c, navUrl ? 45000 : undefined);
-  if (mode === 'battle') {
-    // 首页默认就是 battle，但用户上次选过别的模式时要显式切回来
-    await c.ev("(function(){var s=document.querySelector('select');if(!s||s.value==='battle')return;var d=Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value');d.set.call(s,'battle');s.dispatchEvent(new Event('change',{bubbles:true}));})()").catch(() => {});
-    await sleep(1200);
+  if (mode) {
+    // 上次用过的模式会被记住，显式切回来
+    await setMode(c, mode);
+    await sleep(600);
+    await waitReady(c);
   }
   log('tab ready', tab.id, url);
   minimizeChrome();
@@ -665,6 +821,7 @@ async function typePrompt(c, text) {
   const body = text.slice(0, MAX_PROMPT_CHARS);
   const want = body.replace(/[\s\u00a0\u200b]/g, '').length;
   // 一次插入整段：逐字符发键事件要几十秒，长 prompt 期间页面容易自己跳走
+  await c.ev("(function(){var e=" + EDITOR_SEL + ";if(e)e.focus()})()").catch(() => {});
   await c.send('Input.insertText', { text: body });
   await sleep(500);
   let n = await c.ev(VAL_JS);
@@ -711,7 +868,7 @@ async function stopGeneration(c) {
 async function listStreams(c) {
   // n 是绝对帧号（base + 本流帧数），和 readFrames 返回的 n 同一坐标系；
   // 之前这里用的是相对帧数，流被裁剪过（base>0）时游标会对不上，正文重复一遍
-  const v = await c.evJson("(function(){return JSON.stringify((window.__arbStreams||[]).map(function(s){return {id:s.id,u:s.u,t:s.t,n:(s.base||0)+s.frames.length,done:!!s.done}}))})()");
+  const v = await c.evJson("(function(){return JSON.stringify((window.__arbStreams||[]).map(function(s){return {id:s.id,u:s.u,status:s.status||0,t:s.t,n:(s.base||0)+s.frames.length,done:!!s.done}}))})()");
   return v || [];
 }
 async function readFrames(c, sid, from) {
@@ -828,6 +985,7 @@ async function askOnce(s, prompt, onDelta, ctx) {
   const preList = (await listStreams(c)) || [];
   const pre = new Map(preList.map(x => [x.id, x.n]));
   const sendTs = Date.now();
+  await c.send('Page.bringToFront').catch(() => {});
   await typePrompt(c, prompt);
   const t0 = Date.now();
   let text = '', reasoning = '', done = false, routed = '', tick = 0, doneNoTextAt = 0, doneSeen = false;
@@ -856,7 +1014,7 @@ async function askOnce(s, prompt, onDelta, ctx) {
     // 客户端已经断开（Ctrl-C）：任务没必要继续跑，占着全局队列
     if (aborted()) { throw Object.assign(new Error('aborted by client'), { aborted: true }); }
     const now = (await listStreams(c)) || [];
-    const cand = now.filter(x => /create-evaluation|create-chat|realtime|ai-proxy/.test(x.u) && (x.t >= sendTs - 1500 || pre.has(x.id)));
+    const cand = now.filter(x => /create-evaluation|create-chat|realtime|ai-proxy|\/api\/chat\/[^/]+\/events/.test(x.u) && (x.t >= sendTs - 1500 || pre.has(x.id)));
     if (++tick % 30 === 0) log('poll', JSON.stringify({ cur: [...cursors], len: text.length, streams: now.length, done }));
     if (!cand.length) {
       if (await c.ev(VERIFY_JS)) throw needVerify(c);
@@ -865,7 +1023,8 @@ async function askOnce(s, prompt, onDelta, ctx) {
         if (left <= 1) {
           sendRetries++;
           log('no stream after ' + Math.round((Date.now() - lastSendAt) / 1000) + 's, re-sending #' + sendRetries);
-          try { await typePrompt(c, prompt); } catch (e) { log('re-send failed', e.message); }
+          try { await c.send('Page.bringToFront').catch(() => {});
+  await typePrompt(c, prompt); } catch (e) { log('re-send failed', e.message); }
           lastSendAt = Date.now();
           continue;
         }
@@ -881,6 +1040,7 @@ async function askOnce(s, prompt, onDelta, ctx) {
       if (r.f && r.f.length) {
         cursors.set(st.id, r.n); lastFrameAt = Date.now();
         for (const f of r.f) {
+          if ((st.status === 403 && /create-chat|create-evaluation/.test(st.u)) || (f.l && /recaptcha validation failed/i.test(f.l))) throw needVerify(c);
           if (applyFrame(f).out) st.hasOut = true;
         }
       }
@@ -897,13 +1057,14 @@ async function askOnce(s, prompt, onDelta, ctx) {
   }
   if (!text.trim()) throw new Error('empty answer from upstream');
   dismissReviewSoon(c);
-  return { text, reasoning, routed, done, tools };
+  const images = await collectImages(c);
+  return { text, reasoning, routed, done, tools, images };
 }
 
 /* ---------- battle / side-by-side ---------- */
 // 对战页把两个回答并排放在一个 carousel 里，每条是一个子节点：
 // 第一行是「助手 A / 助手 B」（投票后换成真实模型名），下面是正文。
-const BATTLE_PANES_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('div')).filter(function(e){return String(e.className||'').indexOf('@container/carousel')>=0});if(!cs.length)return '';var c=cs[cs.length-1];if(c.childElementCount!==2)return '';function pane(k){var sp=[].slice.call(k.querySelectorAll('span')).map(function(s){return (s.innerText||'').trim()}).filter(Boolean);var t=(k.innerText||'').trim();var lb=sp[0]||'';return {label:lb,text:t.slice(lb.length).trim()}}return JSON.stringify({a:pane(c.children[0]),b:pane(c.children[1])})})()";
+const BATTLE_PANES_JS = "(function(){var cs=[].slice.call(document.querySelectorAll('div')).filter(function(e){return String(e.className||'').indexOf('@container/carousel')>=0});if(!cs.length)return '';var c=cs[cs.length-1];if(c.childElementCount!==2)return '';function pane(k){var sp=[].slice.call(k.querySelectorAll('span')).map(function(s){return (s.innerText||'').trim()}).filter(Boolean);var t=(k.innerText||'').trim();var lb=sp[0]||'';var ims=[].slice.call(k.querySelectorAll('img')).filter(function(im){var s=String(im.currentSrc||im.src||'');if(!/^data:image\\//.test(s)&&!/^https?:/.test(s))return false;if(/googleusercontent\\.com\\/a\\//.test(s))return false;var r=im.getBoundingClientRect();return Math.max(im.naturalWidth||r.width,im.naturalHeight||r.height)>=64}).map(function(im){return String(im.currentSrc||im.src||'')});var tx=t.slice(lb.length).trim().split('\\n').map(function(x){return x.trim()}).filter(function(x){return x&&x!=='Edit'&&x!=='Copy'&&x!=='Retry'}).join('\\n').trim();return {label:lb,text:tx,images:ims}}return JSON.stringify({a:pane(c.children[0]),b:pane(c.children[1])})})()";
 const VOTE_READY_JS = "(()=>{var re=/^(A\s*更好|B\s*更好|都好|都不好|A is better|B is better|Tie|Both are bad|Both are good)$/i;var bs=[].slice.call(document.querySelectorAll('button'));return bs.filter(function(b){return re.test((b.innerText||'').trim())}).length>=2})()";
 const VOTE_RE = {
   a: /^A\s*更好$|^A is better$/i,
@@ -921,29 +1082,45 @@ async function readBattlePanes(c) {
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
 
-const NOT_READY_RE = /^(Generating|生成中|Thinking|思考中)[.…]*$/i;
+// arena 自己生成失败时页面上会出现这句，别一直等到超时
+const PAGE_ERR_JS = "(()=>{try{var t=document.body.innerText||'';return /Something went wrong while generating|生成响应时出错|Please try again\\./i.test(t)}catch(e){return false}})()";
+const NOT_READY_RE = /^(Generating|生成中|Thinking|思考中|Creating|生成图片|正在生成|绘制中)/i;
 const paneReady = (t) => !!t && !NOT_READY_RE.test(String(t).trim());
+// 图片模式的两栏没有正文，只有图
+const paneHasPic = (p) => !!(p && p.images && p.images.length);
 
 async function askBattle(s, prompt) {
   const c = s.cdp;
   if (await c.ev(VERIFY_JS)) throw needVerify(c);
   if (!(await c.ev(READY_JS))) await waitReady(c);
+  await setMode(c, 'battle');
+  await sleep(800);
   for (let i = 0; i < 24; i++) { if (await c.ev(MODELS_READY_JS).catch(() => false)) break; await sleep(500); }
   await sleep(600);
   if (await isGenerating(c)) { await stopGeneration(c); await sleep(800); }
+  await c.send('Page.bringToFront').catch(() => {});
   await typePrompt(c, prompt);
   const t0 = Date.now();
-  let lastSig = '', changedAt = Date.now(), sawSendStuck = 0;
+  let lastSig = '', changedAt = Date.now(), sawSendStuck = 0, genSince = 0, pageErr = 0;
   while (Date.now() - t0 < ASK_MAX_MS) {
     await sleep(POLL_MS);
     if (c.closed) throw new Error('tab closed');
     if (await c.ev(VERIFY_JS)) throw needVerify(c);
     const p = await readBattlePanes(c);
-    if (p && paneReady(p.a.text) && paneReady(p.b.text)) {
+    if (p && (paneHasPic(p.a) || paneReady(p.a.text)) && (paneHasPic(p.b) || paneReady(p.b.text))) {
       if (await c.ev(VOTE_READY_JS)) return p;
       const sig = p.a.text.length + ':' + p.b.text.length;
       if (sig !== lastSig) { lastSig = sig; changedAt = Date.now(); }
       else if (Date.now() - changedAt > 8000) return p;  // 投票条没渲染也别卡死
+    } else if (await c.ev(PAGE_ERR_JS).catch(() => false)) {
+      // 上游自己挂了（常见于图片生成），早点把错误抛给客户端
+      if (++pageErr >= 3) throw new Error('arena 生成失败：页面报 Something went wrong');
+      await sleep(1000);
+      continue;
+    } else if (p) {
+      // 图片模式下两栏长时间只有「Generating image...」，别一直等到 2 小时上限
+      if (!genSince) genSince = Date.now();
+      if (Date.now() - genSince > 360000) throw new Error('battle timeout: 图片一直没生成出来');
     } else if (!p) {
       const left = await c.ev(VAL_JS).catch(() => 0);
       if (left > 1) {
@@ -968,6 +1145,20 @@ async function voteBattle(c, choice) {
     await sleep(500);
   }
   return await readBattlePanes(c);
+}
+
+/* ---------- 沙盒文件 ---------- */
+// 沙盒在云端，本地只能让 agent 代跑命令；输出里常带代码块，剥一层
+const shellq = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+const SANDBOX_CMDS = {
+  ls: (p) => 'ls -la ' + shellq(p),
+  read: (p) => 'cat ' + shellq(p),
+  get: (p) => 'base64 -w0 ' + shellq(p)
+};
+
+function stripFence(t) {
+  const m = String(t || '').trim().match(/^```[a-zA-Z0-9]*\n([\s\S]*?)\n```$/);
+  return m ? m[1] : String(t || '').trim();
 }
 
 /* ---------- queue ---------- */
@@ -1060,6 +1251,39 @@ const server = http.createServer(async (req, res) => {
       limits: { maxQueue: MAX_QUEUE, maxSessions: MAX_SESSIONS, minGapMs: MIN_GAP_MS, maxPromptChars: MAX_PROMPT_CHARS },
       auth: !!AUTH_TOKEN,
     });
+  }
+  if (u.pathname === '/auth/status' || u.pathname === '/auth/ensure') {
+    try {
+      await ensureChrome();
+      const s = await getSession(u.searchParams.get('session') || DEFAULT_SESSION, { mode: 'agent' });
+      const info = await s.cdp.evJson(`(async function(){
+        var hasLoginBtn = [].slice.call(document.querySelectorAll("button,a")).some(function(el){
+          var t = (el.innerText || "").trim();
+          return /^(Log In|Log in|Sign up for free)$/i.test(t) && el.getBoundingClientRect().width > 0;
+        });
+        var apiOk = false;
+        try {
+          var r = await fetch("/api/history/unified?limit=1&includeArchived=false", {credentials:"include"});
+          apiOk = !!(r && r.ok);
+        } catch (e) {}
+        return JSON.stringify({ loggedIn: apiOk && !hasLoginBtn, apiOk: apiOk, hasLoginBtn: hasLoginBtn, url: location.href });
+      })()`);
+      const loggedIn = !!(info && info.loggedIn);
+      let action = 'none';
+      if (u.pathname === '/auth/ensure') {
+        if (!loggedIn) {
+          restoreChrome();
+          await s.cdp.send('Page.bringToFront').catch(() => {});
+          action = 'brought_to_front';
+        } else {
+          minimizeChrome();
+          action = 'minimized';
+        }
+      }
+      return send(200, Object.assign({ ok: true, action }, info || { loggedIn: false }));
+    } catch (e) {
+      return send(500, { ok: false, loggedIn: false, error: e.message });
+    }
   }
   if (u.pathname === '/debug') {
     const name = u.searchParams.get('session') || DEFAULT_SESSION;
@@ -1417,8 +1641,13 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
           const p = await askBattle(s2, prompt);
           battleRounds.set(name, { panes: p, mode: opts.mode, at: Date.now() });
           const text = '**A · ' + (p.a.label || 'A') + '**\n\n' + (p.a.text || '') + '\n\n---\n\n**B · ' + (p.b.label || 'B') + '**\n\n' + (p.b.text || '') + '\n\n投票：/vote a | b | tie | both';
-          if (wantStream) chunk({ content: text });
-          return { text };
+          const ia = await grabImages(s2.cdp, p.a.images || []);
+          const ib = await grabImages(s2.cdp, p.b.images || []);
+          const images = [];
+          ia.forEach((im, i) => images.push({ name: 'A' + (i ? '-' + (i + 1) : ''), mime: im.mime, data: im.data }));
+          ib.forEach((im, i) => images.push({ name: 'B' + (i ? '-' + (i + 1) : ''), mime: im.mime, data: im.data }));
+          if (wantStream) { chunk({ content: text }); if (images.length) chunk({ arena_images: images }); }
+          return { text, images };
         } finally {
           s2.busy = false;
         }
@@ -1467,6 +1696,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         const r = await enqueue(run);
         if (truncated) chunk({ reasoning_content: '\n\u00b7 prompt 超长，已截断到 ' + MAX_PROMPT_CHARS + ' 字符\n' });
         if (r && r.routed) chunk({ reasoning_content: '\n\u00b7 routed -> ' + r.routed + '\n' });
+        if (r && r.images && r.images.length) chunk({ arena_images: r.images });
         out('data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'arena-agent', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
         out('data: [DONE]\n\n');
       } catch (e) {
@@ -1493,7 +1723,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
         id, object: 'chat.completion', created, model: body.model || 'arena-agent',
         choices: [{ index: 0, message: { role: 'assistant', content: r.text }, finish_reason: 'stop' }],
         usage: { prompt_tokens: prompt.length, completion_tokens: (r.text || '').length, total_tokens: prompt.length + (r.text || '').length },
-        arena: { tools: r.tools, reasoning: r.reasoning, routed: r.routed, truncated }
+        arena: { tools: r.tools, reasoning: r.reasoning, routed: r.routed, truncated, images: r.images || [] }
       });
     } catch (e) {
       log('v1 error:', e.message);
@@ -1554,7 +1784,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       const endSSE = startSSE(res);
       try {
         const r = await enqueue(run);
-        out('data: ' + JSON.stringify({ type: 'done', text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated }) + '\n\n');
+        out('data: ' + JSON.stringify({ type: 'done', text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated, images: r.images || [] }) + '\n\n');
       } catch (e) {
         await fail(e);
         if (!(e.aborted || clientGone)) out('data: ' + JSON.stringify({ type: 'error', error: e.message }) + '\n\n');
@@ -1566,12 +1796,47 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
 
     try {
       const r = await enqueue(run);
-      return send(200, { ok: true, text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated });
+      return send(200, { ok: true, text: r.text, reasoning: r.reasoning, routed: r.routed, tools: r.tools, truncated, images: r.images || [] });
     } catch (e) {
       await fail(e);
       if (e.aborted || clientGone) return send(499, { ok: false, error: 'client closed request' });
       const code = /NEED_VERIFY/.test(e.message) ? 409 : (e.busy || /busy/.test(e.message)) ? 429 : 500;
       return send(code, { ok: false, error: e.message });
+    }
+  }
+  if (u.pathname === '/sandbox') {
+    const name = u.searchParams.get('session') || DEFAULT_SESSION;
+    const op = (u.searchParams.get('op') || 'ls').toLowerCase();
+    const target = u.searchParams.get('path') || '/home/user';
+    if (!SANDBOX_CMDS[op]) return send(400, { ok: false, error: 'op 只能是 ls / read / get' });
+    const prompt = '只运行下面这一条命令，把标准输出原样贴出来。不要解释、不要加代码块标记、不要省略内容：\n' + SANDBOX_CMDS[op](target);
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableFinished) clientGone = true; });
+    const ctx = { aborted: () => clientGone };
+    try {
+      if (!(await ensureChrome())) throw chromeDownError();
+      const s = await getSession(name, { mode: 'agent' });
+      s.busy = true;
+      let r;
+      try {
+        const gap = Date.now() - (s.lastAsk || 0);
+        if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
+        s.lastAsk = Date.now();
+        r = await askOnce(s, prompt, null, ctx);
+        s.lastAsk = Date.now();
+      } finally {
+        s.busy = false;
+      }
+      const out = stripFence(r.text);
+      if (op === 'get') {
+        const b64 = out.replace(/[^A-Za-z0-9+/=]/g, '');
+        if (!b64) return send(502, { ok: false, error: '沙盒没有返回 base64' });
+        return send(200, { ok: true, op, path: target, data: b64 });
+      }
+      return send(200, { ok: true, op, path: target, output: out });
+    } catch (e) {
+      log('sandbox error:', e.message);
+      return send(/NEED_VERIFY/.test(e.message) ? 409 : 500, { ok: false, error: e.message });
     }
   }
   send(404, { error: 'not found' });

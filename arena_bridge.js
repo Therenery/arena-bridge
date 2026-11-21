@@ -11,8 +11,9 @@ const path = require('path');
 const { exec, spawn } = require('child_process');
 const { parseFrame } = require('./lib/parse');
 
-const VERSION = '0.4.9';
+const VERSION = '0.5.0';
 let authUserCache = null;
+let modelCatalogCache = { at: 0, byArena: {} };
 const CDP_PORT = 9222;
 const PORT = 17892;
 const HOST = '127.0.0.1';
@@ -688,47 +689,53 @@ function needVerify(c) {
   return new Error('NEED_VERIFY');
 }
 
-// arena 的模式选择现在是按钮 + 菜单，不再吃 <select>；两种都兼容
-const MODE_BTN_JS = "(function(){var bs=[].slice.call(document.querySelectorAll('button[role=combobox]'));for(var i=0;i<bs.length;i++){var t=(bs[i].innerText||'').trim();if(/^(Agent|Battle|Direct|Side)/i.test(t)){var r=bs[i].getBoundingClientRect();if(r.width>4)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:t})}}return ''})()";
+// arena 新版模式选择是 button[aria-label="Mode"]（只有 Chat / Agent 两项）；兼容旧版 Battle/Direct/Side
+const MODE_BTN_JS = "(function(){var b=document.querySelector('button[aria-label=\"Mode\"]');if(b){var r=b.getBoundingClientRect();if(r.width>4)return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:(b.innerText||'').trim()})}var bs=[].slice.call(document.querySelectorAll('button[role=combobox]'));for(var i=0;i<bs.length;i++){var t=(bs[i].innerText||'').trim();if(/^(Agent|Chat|Battle|Direct|Side)/i.test(t)){var r2=bs[i].getBoundingClientRect();if(r2.width>4)return JSON.stringify({x:Math.round(r2.left+r2.width/2),y:Math.round(r2.top+r2.height/2),t:t})}}return ''})()";
 
 async function setMode(c, mode) {
-  const want = { battle: 'Battle', agent: 'Agent', direct: 'Direct', side: 'Side' }[mode];
-  if (!want) return;
+  const isAgent = mode === 'agent';
+  const legacyWant = { battle: 'Battle', agent: 'Agent', direct: 'Direct', side: 'Side' }[mode];
+  const newWant = isAgent ? 'Agent' : 'Chat';
+  if (!legacyWant) return false;
   for (let i = 0; i < 3; i++) {
     const raw = await c.ev(MODE_BTN_JS).catch(() => '');
     if (raw && raw.charAt(0) === '{') {
       const p = JSON.parse(raw);
-      if (new RegExp('^' + want, 'i').test(p.t)) return;
+      if (new RegExp('^(' + legacyWant + '|' + newWant + ')$', 'i').test(p.t)) return false;
       await realClick(c, p);
       await sleep(700);
-      const ok = await c.ev("(function(){var w=" + JSON.stringify(want) + ";var os=[].slice.call(document.querySelectorAll('[role=option]'));for(var i=0;i<os.length;i++){var t=(os[i].innerText||'').trim();if(t.indexOf(w)===0){os[i].click();return 'ok'}}return ''})()").catch(() => '');
+      const ok = await c.ev("(function(){var ws=[" + JSON.stringify(legacyWant) + "," + JSON.stringify(newWant) + "];var os=[].slice.call(document.querySelectorAll('[role=option]'));for(var k=0;k<ws.length;k++){for(var i=0;i<os.length;i++){var t=(os[i].innerText||'').trim();if(t.indexOf(ws[k])===0){os[i].click();return 'ok'}}}return ''})()").catch(() => '');
       await sleep(900);
-      if (ok === 'ok') return;
+      if (ok === 'ok') return true;
       continue;
     }
-    // 老界面兜底
-    await c.ev("(function(){var s=document.querySelector('select');if(!s||s.value===" + JSON.stringify(mode) + ")return;var d=Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value');d.set.call(s," + JSON.stringify(mode) + ");s.dispatchEvent(new Event('change',{bubbles:true}));})()").catch(() => {});
-    await sleep(900);
-    return;
+    return false;
   }
+  return false;
 }
 
 async function openTab(model, mode, models, navUrl) {
   const q = [];
-  if (model && !/^arena-/.test(model)) q.push('model_a=' + encodeURIComponent(model));
+  if (model && !/^arena-/.test(model) && !/^(auto|router)$/i.test(model)) q.push('model_a=' + encodeURIComponent(model));
   let base = '/agent';
   if (mode === 'direct') base = '/text/direct';
   else if (mode === 'side') {
     base = '/text/side-by-side';
-    if (models && models[0]) q.push('model_a=' + encodeURIComponent(models[0]));
-    if (models && models[1]) q.push('model_b=' + encodeURIComponent(models[1]));
+    let pair = Array.isArray(models) ? models.filter(Boolean).slice(0, 2) : [];
+    if (pair.length < 2) {
+      const live = (modelCatalogCache.byArena && modelCatalogCache.byArena.text) || [];
+      const fallback = live.length >= 2 ? live.slice(0, 2) : ['gemini-3.8-flash-high', 'deepseek-v4.1-flash-high'];
+      for (const m of fallback) { if (pair.length < 2 && !pair.includes(m)) pair.push(m); }
+    }
+    if (pair[0]) q.push('model_a=' + encodeURIComponent(pair[0]));
+    if (pair[1]) q.push('model_b=' + encodeURIComponent(pair[1]));
   } else if (mode === 'battle') {
-    // 对战没有独立路由：首页的 Mode 下拉里选 Battle
+    // 首页默认即为匿名双栏 Battle
     base = '/';
   }
   const url = navUrl || ('https://arena.ai' + base + (q.length ? '?' + q.join('&') : ''));
   // 对战 / 并排每一轮都是独立会话，接管旧页面会把上一轮的问答带进来
-  const adopted = (navUrl || mode === 'battle' || mode === 'side') ? null : await adoptTab(base);
+  const adopted = (navUrl || mode === 'battle' || mode === 'side' || (mode === 'direct' && q.length)) ? null : await adoptTab(base);
   if (adopted) {
     log('adopted tab', adopted.tabId, String(adopted.url).slice(0, 60));
     minimizeChrome();
@@ -744,10 +751,12 @@ async function openTab(model, mode, models, navUrl) {
     // 打开已有会话时要等历史渲染完，比空白页慢
     await waitReady(c, navUrl ? 45000 : undefined);
     if (mode) {
-      // 上次用过的模式会被记住，显式切回来
-      await setMode(c, mode);
-      await sleep(600);
-      await waitReady(c);
+      // 上次用过的模式会被记住，显式切回来（仅当实际切换了才再等）
+      const changed = await setMode(c, mode);
+      if (changed) {
+        await sleep(600);
+        await waitReady(c);
+      }
     }
   } catch (err) {
     try { if (c) c.close(); } catch (_) {}
@@ -1100,13 +1109,11 @@ const paneReady = (t) => !!t && !NOT_READY_RE.test(String(t).trim());
 // 图片模式的两栏没有正文，只有图
 const paneHasPic = (p) => !!(p && p.images && p.images.length);
 
-async function askBattle(s, prompt) {
+async function askBattle(s, prompt, mode) {
   const c = s.cdp;
   if (await c.ev(VERIFY_JS)) throw needVerify(c);
   if (!(await c.ev(READY_JS))) await waitReady(c);
-  await setMode(c, 'battle');
-  await sleep(800);
-  for (let i = 0; i < 24; i++) { if (await c.ev(MODELS_READY_JS).catch(() => false)) break; await sleep(500); }
+  await setMode(c, mode === 'side' ? 'side' : 'battle');
   await sleep(600);
   if (await isGenerating(c)) { await stopGeneration(c); await sleep(800); }
   await c.send('Page.bringToFront').catch(() => {});
@@ -1322,8 +1329,64 @@ const server = http.createServer(async (req, res) => {
       return send(200, { state: st, url: href });
     } catch (e) { return send(500, { error: e.message }); }
   }
+  const fetchLiveModels = async (arenaKind, force) => {
+    const kind = arenaKind || 'text';
+    if (!force && Date.now() - modelCatalogCache.at < 300000 && modelCatalogCache.byArena[kind] && modelCatalogCache.byArena[kind].length) {
+      return modelCatalogCache.byArena[kind];
+    }
+    try {
+      if (!(await ensureChrome())) return modelCatalogCache.byArena[kind] || [];
+      const list = await cdpApi('GET', '/json/list');
+      let tab = Array.isArray(list) ? list.find(t => t.type === 'page' && /^https:\/\/arena\.ai/i.test(t.url || '')) : null;
+      let c = null;
+      let owned = false;
+      if (tab) {
+        c = await connectTab(tab.id);
+        owned = true;
+      } else {
+        const s0 = sessions.values().next().value;
+        if (s0 && s0.cdp && !s0.cdp.closed) c = s0.cdp;
+      }
+      if (!c) return modelCatalogCache.byArena[kind] || [];
+      try {
+        const out = await c.evJson(`(async function(){
+          try {
+            var r = await fetch("/nextjs-api/model-catalog", {credentials:"include"});
+            if (!r || !r.ok) return "{}";
+            var arr = await r.json();
+            if (!Array.isArray(arr)) return "{}";
+            var res = {};
+            for (var i = 0; i < arr.length; i++) {
+              var a = arr[i];
+              if (!a || !a.arena || !Array.isArray(a.models)) continue;
+              res[a.arena] = a.models
+                .filter(function(m){ return m && m.userSelectable && (m.publicName || m.displayName); })
+                .sort(function(x, y){ return (x.rank || 9999) - (y.rank || 9999); })
+                .map(function(m){ return m.publicName || m.displayName; });
+            }
+            return JSON.stringify(res);
+          } catch (e) { return "{}"; }
+        })()`).catch(() => null);
+        if (out && typeof out === 'object' && Object.keys(out).length) {
+          modelCatalogCache = { at: Date.now(), byArena: out };
+        }
+      } finally {
+        if (owned && c) try { c.close(); } catch (e) {}
+      }
+    } catch (e) {}
+    return modelCatalogCache.byArena[kind] || [];
+  };
   if (u.pathname === '/models') {
-    return send(200, { models: ['auto', 'max'] });
+    const kind = u.searchParams.get('arena') || 'text';
+    const force = u.searchParams.get('refresh') === '1';
+    const live = await fetchLiveModels(kind, force);
+    const merged = ['auto', 'max'];
+    const seen = new Set(merged.map(x => x.toLowerCase()));
+    for (const m of live) {
+      const k = String(m).toLowerCase();
+      if (!seen.has(k)) { seen.add(k); merged.push(m); }
+    }
+    return send(200, { models: merged, arena: kind, count: merged.length });
   }
   const fetchLiveRepos = async (cdp) => {
     const out = await cdp.evJson(`(async function(){
@@ -1629,7 +1692,7 @@ const server = http.createServer(async (req, res) => {
         const gap = Date.now() - (s.lastAsk || 0);
         if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
         s.lastAsk = Date.now();
-        const p = await askBattle(s, prompt);
+        const p = await askBattle(s, prompt, mode);
         battleRounds.set(session, { panes: p, mode, at: Date.now() });
         return p;
       } finally {
@@ -1799,7 +1862,10 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
       log('PROMPT len=' + prompt.length);
     }
     const truncated = prompt.length > MAX_PROMPT_CHARS;
-    const opts = { model: body.model && body.model !== 'auto' ? body.model : '', mode: (body.metadata && body.metadata.mode) || 'agent', models: (function (m) { if (Array.isArray(m)) return m.map(String).filter(Boolean).slice(0, 2); if (typeof m === 'string' && m) return m.split(',').map(function (x) { return x.trim(); }).filter(Boolean).slice(0, 2); return []; })(body.metadata && body.metadata.models), fresh };
+    const reqModel = body.model && body.model !== 'auto' ? String(body.model).trim() : '';
+    const explicitMode = body.metadata && body.metadata.mode ? String(body.metadata.mode).trim() : '';
+    const inferredMode = explicitMode || (reqModel === 'arena-direct' || (reqModel && !/^arena-/i.test(reqModel)) ? 'direct' : 'agent');
+    const opts = { model: reqModel, mode: inferredMode, models: (function (m) { if (Array.isArray(m)) return m.map(String).filter(Boolean).slice(0, 2); if (typeof m === 'string' && m) return m.split(',').map(function (x) { return x.trim(); }).filter(Boolean).slice(0, 2); return []; })(body.metadata && body.metadata.models), fresh };
     const wantStream = !!body.stream;
     const id = 'chatcmpl-' + Date.now().toString(36);
     const created = Math.floor(Date.now() / 1000);
@@ -1825,7 +1891,7 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
           const gap = Date.now() - (s2.lastAsk || 0);
           if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap);
           s2.lastAsk = Date.now();
-          const p = await askBattle(s2, prompt);
+          const p = await askBattle(s2, prompt, opts.mode);
           battleRounds.set(name, { panes: p, mode: opts.mode, at: Date.now() });
           const text = '**A · ' + (p.a.label || 'A') + '**\n\n' + (p.a.text || '') + '\n\n---\n\n**B · ' + (p.b.label || 'B') + '**\n\n' + (p.b.text || '') + '\n\n投票：/vote a | b | tie | both';
           const ia = await grabImages(s2.cdp, p.a.images || []);
@@ -1933,7 +1999,9 @@ const ctext = (c) => typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => x
     }
   }
   if (u.pathname === '/v1/models') {
-    return send(200, { object: 'list', data: [{ id: 'arena-agent', object: 'model', created: 0, owned_by: 'arena' }, { id: 'arena-direct', object: 'model', created: 0, owned_by: 'arena' }] });
+    const live = await fetchLiveModels('text', false);
+    const ids = ['arena-agent', 'arena-direct', ...live.filter(m => m !== 'arena-agent' && m !== 'arena-direct')];
+    return send(200, { object: 'list', data: ids.map(id => ({ id, object: 'model', created: 0, owned_by: 'arena' })) });
   }
   if (u.pathname === '/ask' && req.method === 'POST') {
     let body;
